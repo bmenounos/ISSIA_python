@@ -1,0 +1,27 @@
+# ISSIA Python Requirements
+# Core dependencies for ISSIA processing
+
+# Array processing and parallelization
+numpy>=1.20.0
+dask[array]>=2021.0.0
+dask[distributed]>=2021.0.0
+
+# Geospatial data handling
+rasterio>=1.2.0
+xarray>=0.19.0
+
+# Scientific computing
+scipy>=1.7.0
+
+# Visualization
+matplotlib>=3.3.0
+
+# Optional performance enhancements
+numba>=0.54.0  # JIT compilation for faster processing
+zarr>=2.10.0   # Chunked storage format
+
+# Development and testing (optional)
+pytest>=6.0.0
+pytest-cov>=2.12.0
+black>=21.0    # Code formatting
+flake8>=3.9.0  # Linting
