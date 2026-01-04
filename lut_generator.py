@@ -6,8 +6,8 @@ Generates the three required lookup tables:
 2. Anisotropy Factor LUT - 5D array [illumination, viewing, azimuth, grain_size, wavelength]
 3. White-Sky Albedo LUT - 2D array [grain_size, wavelength]
 
-These LUTs are generated using a radiative transfer model (e.g., SNICAR, TARTES, 
-or similar snow radiative transfer models)
+Uses the ART (Asymptotic Radiative Transfer) model from Kokhanovsky & Zege (2004)
+for generating physically accurate snow/ice reflectance spectra.
 """
 
 import numpy as np
@@ -16,6 +16,7 @@ from dask.diagnostics import ProgressBar
 from pathlib import Path
 from typing import Tuple, Optional
 import warnings
+from art_model import ARTSnowModel, simulate_snow_reflectance, simulate_snow_albedo
 
 
 class ISSIALUTGenerator:
@@ -274,76 +275,46 @@ class ISSIALUTGenerator:
                                   viewing: float,
                                   relative_azimuth: float) -> np.ndarray:
         """
-        Simulate directional snow reflectance using radiative transfer model
+        Simulate directional snow reflectance using ART model
         
-        This is a placeholder - in production, replace with actual RT model
-        (SNICAR, TARTES, DISORT, etc.)
+        Uses the Asymptotic Radiative Transfer (ART) model from 
+        Kokhanovsky & Zege (2004) for accurate snow/ice reflectance.
         
         Parameters:
         -----------
         grain_size : float
             Effective grain radius (micrometers)
         illumination : float
-            Illumination angle (degrees)
+            Illumination angle (degrees from zenith)
         viewing : float
-            Viewing angle (degrees)
+            Viewing angle (degrees from zenith)
         relative_azimuth : float
             Relative azimuth angle (degrees)
             
         Returns:
         --------
         reflectance : np.ndarray
-            Spectral reflectance [n_wavelengths]
+            Spectral BRDF [n_wavelengths]
         """
-        warnings.warn(
-            "Using simplified snow reflectance model. "
-            "Replace with actual radiative transfer model for production use."
+        # Use ART model for physically accurate simulation
+        reflectance = simulate_snow_reflectance(
+            wavelengths=self.wavelengths,
+            grain_size_um=grain_size,
+            solar_zenith=illumination,
+            view_zenith=viewing,
+            relative_azimuth=relative_azimuth,
+            impurity_type=None,  # Clean snow for LUTs
+            impurity_conc=0.0
         )
-        
-        # Simplified parameterization based on Kokhanovsky-Zege model
-        # This is a placeholder - use proper RT model in production!
-        
-        # Convert wavelength to micrometers
-        wl_um = self.wavelengths / 1000.0
-        
-        # Ice absorption coefficient (simplified)
-        # Real values should come from Warren & Brandt (2008) or similar
-        alpha_ice = np.where(
-            wl_um < 1.4,
-            0.001 * (wl_um - 0.4)**2,  # Visible/NIR
-            0.1 * np.exp((wl_um - 1.5) * 2)  # SWIR
-        )
-        
-        # Grain size effect on reflectance
-        grain_um = grain_size / 1000.0  # Convert to mm for calculation
-        tau = 4 * alpha_ice * grain_um
-        
-        # Base reflectance (clean snow)
-        r0 = np.exp(-np.sqrt(tau))
-        
-        # Angular dependence (simplified BRDF)
-        mu_i = np.cos(np.deg2rad(illumination))
-        mu_v = np.cos(np.deg2rad(viewing))
-        
-        # Phase function (simplified)
-        cos_phase = (mu_i * mu_v + 
-                    np.sqrt(1 - mu_i**2) * np.sqrt(1 - mu_v**2) * 
-                    np.cos(np.deg2rad(relative_azimuth)))
-        
-        # Angular correction
-        f_angle = 1.0 + 0.1 * cos_phase
-        
-        # Reflectance
-        reflectance = r0 * f_angle * (mu_i + mu_v) / (mu_i * mu_v + 0.1)
-        reflectance = np.clip(reflectance, 0, 1)
         
         return reflectance
     
     def _simulate_snow_albedo(self, grain_size: float) -> np.ndarray:
         """
-        Simulate hemispherical (white-sky) snow albedo
+        Simulate hemispherical (white-sky) snow albedo using ART model
         
-        This is a placeholder - replace with actual RT model
+        Uses the Asymptotic Radiative Transfer (ART) model for
+        accurate spherical albedo calculation.
         
         Parameters:
         -----------
@@ -355,23 +326,13 @@ class ISSIALUTGenerator:
         albedo : np.ndarray
             Spectral albedo [n_wavelengths]
         """
-        # Simplified - integrate over hemisphere
-        # In production, use proper RT model with diffuse illumination
-        
-        # Average over several viewing angles
-        n_angles = 10
-        angles = np.linspace(0, 60, n_angles)
-        
-        albedo = np.zeros(len(self.wavelengths))
-        
-        for angle in angles:
-            weight = np.cos(np.deg2rad(angle)) * np.sin(np.deg2rad(angle))
-            refl = self._simulate_snow_reflectance(grain_size, angle, 0, 0)
-            albedo += weight * refl
-        
-        # Normalize
-        albedo *= 2 * np.pi / albedo.sum()
-        albedo = np.clip(albedo, 0, 1)
+        # Use ART model for hemispherical albedo
+        albedo = simulate_snow_albedo(
+            wavelengths=self.wavelengths,
+            grain_size_um=grain_size,
+            impurity_type=None,  # Clean snow for LUTs
+            impurity_conc=0.0
+        )
         
         return albedo
     

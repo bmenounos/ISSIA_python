@@ -128,9 +128,9 @@ class ISSIAProcessor:
         asp_file = data_dir / f"{flight_line}_asp.dat"
         aspect = self._read_single_band(asp_file)
         
-        # Read solar zenith angle from .inn file
+        # Read solar zenith and azimuth angles from .inn file
         inn_file = data_dir / f"{flight_line}.inn"
-        solar_zenith = self._read_solar_zenith(inn_file)
+        solar_zenith, solar_azimuth = self._read_solar_zenith(inn_file)
         
         # Get geotransform and projection
         with rasterio.open(atm_file.with_suffix('.hdr')) as src:
@@ -143,40 +143,94 @@ class ISSIAProcessor:
             'slope': slope,
             'aspect': aspect,
             'solar_zenith': solar_zenith,
+            'solar_azimuth': solar_azimuth,
             'transform': transform,
             'crs': crs
         }
     
-    def _read_envi_file(self, filepath: Path) -> da.Array:
+    def _read_envi_file(self, filepath: Path, window=None) -> da.Array:
         """Read ENVI format file and return as Dask array"""
-        with rasterio.open(filepath) as src:
-            data = src.read()
+        # Ensure we're opening the .dat file, not .hdr
+        filepath = Path(filepath)
+        if filepath.suffix.lower() == '.hdr':
+            filepath = filepath.with_suffix('.dat')
+        
+        # Read scale factor from header
+        hdr_file = str(filepath).replace('.dat', '.hdr')
+        scale_factor = 1.0
+        try:
+            with open(hdr_file, 'r') as f:
+                for line in f:
+                    if 'reflectance scale factor' in line.lower():
+                        scale_factor = float(line.split('=')[1].strip())
+                        break
+        except (FileNotFoundError, OSError):
+            # Header file not found or can't be read - use default scale factor
+            pass
+        
+        with rasterio.open(str(filepath)) as src:
+            if window:
+                data = src.read(window=window)
+            else:
+                data = src.read()
+            # Apply scale factor
+            data = data.astype(float) / scale_factor
+            # Convert zeros to NaN (data ignore value)
+            data = np.where(data == 0, np.nan, data)
             # Convert to Dask array with chunking
             dask_data = da.from_array(data, chunks=(data.shape[0], 
                                                      self.chunk_size[0], 
                                                      self.chunk_size[1]))
         return dask_data
     
-    def _read_single_band(self, filepath: Path) -> da.Array:
+    def _read_single_band(self, filepath: Path, window=None) -> da.Array:
         """Read single band file and return as Dask array"""
-        with rasterio.open(filepath) as src:
-            data = src.read(1)
+        # Ensure we're opening the .dat file, not .hdr
+        filepath = Path(filepath)
+        if filepath.suffix.lower() == '.hdr':
+            filepath = filepath.with_suffix('.dat')
+        
+        with rasterio.open(str(filepath)) as src:
+            if window:
+                data = src.read(1, window=window)
+            else:
+                data = src.read(1)
             dask_data = da.from_array(data, chunks=self.chunk_size)
         return dask_data
     
-    def _read_solar_zenith(self, inn_file: Path) -> float:
-        """Extract solar zenith angle from ATCOR .inn file"""
+    def _read_solar_zenith(self, inn_file: Path) -> tuple:
+        """
+        Extract solar zenith and azimuth angles from ATCOR .inn file
+        
+        Returns:
+        --------
+        tuple : (solar_zenith, solar_azimuth) in degrees
+        """
         with open(inn_file, 'r') as f:
-            for line in f:
-                if 'solar zenith' in line.lower() or 'sun zenith' in line.lower():
-                    # Extract number from line
-                    parts = line.split()
-                    for part in parts:
-                        try:
-                            return float(part)
-                        except ValueError:
-                            continue
-        raise ValueError(f"Could not find solar zenith angle in {inn_file}")
+            content = f.read()
+            
+        solar_zenith = None
+        solar_azimuth = None
+        
+        # Look for line with "Solar zenith, azimuth"
+        # Format: "38.1   177.2       Solar zenith, azimuth [degree]"
+        for line in content.split('\n'):
+            if 'solar zenith' in line.lower() and 'azimuth' in line.lower():
+                # Extract two numbers before the text
+                parts = line.split()
+                try:
+                    solar_zenith = float(parts[0])
+                    solar_azimuth = float(parts[1])
+                    break
+                except (ValueError, IndexError):
+                    continue
+        
+        if solar_zenith is None:
+            raise ValueError(f"Could not find solar zenith angle in {inn_file}")
+        if solar_azimuth is None:
+            raise ValueError(f"Could not find solar azimuth angle in {inn_file}")
+            
+        return solar_zenith, solar_azimuth
     
     def continuum_removal(self, spectrum: np.ndarray, 
                          wavelengths: np.ndarray,
@@ -324,12 +378,18 @@ class ISSIAProcessor:
                 grain_size = np.interp(bd, bd_curve, self.grain_radii)
                 return grain_size
         
-        # Vectorize the lookup function for Dask
-        vectorized_lookup = da.vectorize(lookup_grain_size, 
-                                        otypes=[float],
-                                        signature='(),()->()')
+        # Use map_blocks instead of vectorize (removed in newer Dask)
+        def lookup_wrapper(bd_block, illum_block):
+            result = np.zeros_like(bd_block, dtype=float)
+            for i in range(bd_block.shape[0]):
+                for j in range(bd_block.shape[1]):
+                    result[i, j] = lookup_grain_size(bd_block[i, j], illum_block[i, j])
+            return result
         
-        grain_size = vectorized_lookup(band_depth_map, local_illum)
+        grain_size = da.map_blocks(lookup_wrapper, 
+                                   band_depth_map, 
+                                   local_illum,
+                                   dtype=float)
         
         return grain_size
     
@@ -373,21 +433,35 @@ class ISSIAProcessor:
             
             return aniso_spectrum
         
-        # Vectorize for Dask - this returns a spectrum for each pixel
-        vectorized_lookup = da.map_blocks(
-            lambda gs_block, illum_block: np.array([
-                [lookup_anisotropy(gs_block[i,j], illum_block[i,j]) 
-                 for j in range(gs_block.shape[1])]
-                for i in range(gs_block.shape[0])
-            ]),
-            grain_size, local_illum,
-            dtype=float,
-            new_axis=2,
-            chunks=(grain_size.chunks[0], grain_size.chunks[1], len(self.wavelengths))
-        )
+        # Use apply_gufunc for cleaner dimension handling
+        def lookup_pixel_aniso(gs, illum):
+            """Lookup anisotropy for a single pixel - returns spectrum"""
+            if np.isnan(gs) or np.isnan(illum):
+                return np.full(len(self.wavelengths), np.nan)
+            
+            illum_idx = np.argmin(np.abs(self.illumination_angles - illum))
+            view_idx = np.argmin(np.abs(self.viewing_angles - viewing_angle))
+            azim_idx = np.argmin(np.abs(self.relative_azimuths - relative_azimuth))
+            gs_idx = np.argmin(np.abs(self.grain_radii - gs))
+            
+            return self.anisotropy_lut[illum_idx, view_idx, azim_idx, gs_idx, :]
         
-        # Transpose to (wavelength, rows, cols) for consistency
-        anisotropy = da.transpose(vectorized_lookup, (2, 0, 1))
+        # Compute grain size and illumination (small arrays, can fit in memory)
+        gs_array = grain_size.compute()
+        illum_array = local_illum.compute()
+        
+        # Vectorized lookup
+        from numpy import vectorize
+        vec_lookup = vectorize(lookup_pixel_aniso, signature='(),()->(n)')
+        
+        # Apply lookup - output is (rows, cols, wavelengths)
+        aniso_array = vec_lookup(gs_array, illum_array)
+        
+        # Transpose to (wavelengths, rows, cols)
+        aniso_array = np.transpose(aniso_array, (2, 0, 1))
+        
+        # Convert back to dask
+        anisotropy = da.from_array(aniso_array, chunks=(len(self.wavelengths), self.chunk_size[0], self.chunk_size[1]))
         
         return anisotropy
     
@@ -420,24 +494,32 @@ class ISSIAProcessor:
             gs_idx = np.argmin(np.abs(self.grain_radii - gs))
             return self.albedo_lut[gs_idx, :]
         
-        # Vectorize albedo lookup
-        white_sky_albedo = da.map_blocks(
-            lambda gs_block: np.array([
-                [lookup_albedo(gs_block[i,j]) 
-                 for j in range(gs_block.shape[1])]
-                for i in range(gs_block.shape[0])
-            ]),
-            grain_size,
-            dtype=float,
-            new_axis=2,
-            chunks=(grain_size.chunks[0], grain_size.chunks[1], len(self.wavelengths))
-        )
+        # Use vectorize for cleaner dimension handling
+        def lookup_pixel_albedo(gs):
+            """Lookup white-sky albedo for a single pixel - returns spectrum"""
+            if np.isnan(gs):
+                return np.full(len(self.wavelengths), np.nan)
+            
+            gs_idx = np.argmin(np.abs(self.grain_radii - gs))
+            return self.albedo_lut[gs_idx, :]
         
-        # Transpose to (wavelength, rows, cols)
-        white_sky_albedo = da.transpose(white_sky_albedo, (2, 0, 1))
+        # Compute grain size
+        gs_array = grain_size.compute()
         
-        # Calculate spectral albedo using anisotropy correction
-        # This relates HDRF to DHRF (bihemispherical reflectance/albedo)
+        # Vectorized lookup
+        from numpy import vectorize
+        vec_lookup = vectorize(lookup_pixel_albedo, signature='()->(n)')
+        
+        # Apply - output is (rows, cols, wavelengths)
+        albedo_array = vec_lookup(gs_array)
+        
+        # Transpose to (wavelengths, rows, cols)
+        albedo_array = np.transpose(albedo_array, (2, 0, 1))
+        
+        # Convert back to dask
+        white_sky_albedo = da.from_array(albedo_array, chunks=(len(self.wavelengths), self.chunk_size[0], self.chunk_size[1]))
+        
+        # Calculate spectral albedo
         spectral_albedo = white_sky_albedo * (reflectance_hdrf / anisotropy_factor)
         
         return spectral_albedo
