@@ -234,11 +234,12 @@ class ISSIAProcessor:
     
     def continuum_removal(self, spectrum: np.ndarray, 
                          wavelengths: np.ndarray,
-                         left_wl: float = 950.0,
-                         right_wl: float = 1100.0,
+                         left_wl: float = 900.0,
+                         right_wl: float = 1130.0,
                          center_wl: float = 1030.0) -> Tuple[np.ndarray, float]:
         """
-        Perform continuum removal on spectrum for 1030 nm ice absorption feature
+        Perform continuum removal using convex hull method (matches MATLAB ISSIA)
+        Extracts 900-1130nm range, applies convex hull to find upper envelope
         
         Parameters:
         -----------
@@ -260,7 +261,9 @@ class ISSIAProcessor:
         band_depth : float
             Scaled band depth at center wavelength
         """
-        # Find indices for wavelengths
+        from scipy.spatial import ConvexHull
+        
+        # Find indices for wavelength range
         left_idx = np.argmin(np.abs(wavelengths - left_wl))
         right_idx = np.argmin(np.abs(wavelengths - right_wl))
         center_idx = np.argmin(np.abs(wavelengths - center_wl))
@@ -269,23 +272,41 @@ class ISSIAProcessor:
         wl_subset = wavelengths[left_idx:right_idx+1]
         spec_subset = spectrum[left_idx:right_idx+1]
         
-        # Find local maximum around right boundary (shoulder of feature)
-        # Search in region around 1100 nm
-        search_start = np.argmin(np.abs(wavelengths - 1080.0))
-        search_end = np.argmin(np.abs(wavelengths - 1120.0))
-        local_max_idx = search_start + np.argmax(spectrum[search_start:search_end])
+        # Extend spectrum with zeros at ends (like MATLAB)
+        spec_ext = np.concatenate([[0], spec_subset, [0]])
+        x_ext = np.arange(len(spec_ext))
         
-        # Create continuum line
-        continuum = np.interp(wl_subset, 
-                             [wavelengths[left_idx], wavelengths[local_max_idx]],
-                             [spectrum[left_idx], spectrum[local_max_idx]])
+        # Compute convex hull
+        points = np.column_stack([x_ext, spec_ext])
+        try:
+            hull = ConvexHull(points)
+            
+            # Get hull vertices and process like MATLAB
+            K = hull.vertices.copy()
+            K = K[2:]   # Remove first 2
+            K = K[:-1]  # Remove last
+            K = np.sort(K)  # Sort ascending
+            K = K - 1   # Adjust indices
+            
+            # Interpolate continuum using hull points
+            continuum = np.interp(np.arange(len(spec_subset)), K, spec_subset[K])
+            continuum = np.where(continuum < 1e-10, 1e-10, continuum)
+            
+            # Continuum removal
+            continuum_removed = spec_subset / continuum
+            
+        except Exception as e:
+            # Fallback
+            continuum = np.linspace(spec_subset[0], spec_subset[-1], len(spec_subset))
+            continuum = np.where(continuum < 1e-10, 1e-10, continuum)
+            continuum_removed = spec_subset / continuum
         
-        # Continuum removal
-        continuum_removed = spec_subset / continuum
-        
-        # Calculate scaled band depth at center wavelength
-        center_idx_local = np.argmin(np.abs(wl_subset - center_wl))
-        band_depth = 1.0 - continuum_removed[center_idx_local]
+        # Calculate band depth as min of CR spectrum (matches MATLAB)
+        #band_depth = 1.0 - continuum_removed.min()
+
+        center_idx = np.argmin(np.abs(wl_subset - 1030))
+        band_depth = 1.0 - continuum_removed[center_idx]
+
         
         return continuum_removed, band_depth
     
@@ -368,14 +389,18 @@ class ISSIAProcessor:
             # Get band depth vs grain size for this geometry
             bd_curve = self.sbd_lut[illum_idx, view_idx, azim_idx, :]
             
+            # Ensure 1D for interp
+            bd_curve = bd_curve.ravel()
+            grain_radii_1d = np.asarray(self.grain_radii).ravel()
+            
             # Find grain size that matches observed band depth
             if bd >= bd_curve.max():
-                return self.grain_radii[-1]  # Maximum grain size
+                return grain_radii_1d[-1]  # Maximum grain size
             elif bd <= bd_curve.min():
-                return self.grain_radii[0]   # Minimum grain size
+                return grain_radii_1d[0]   # Minimum grain size
             else:
                 # Interpolate
-                grain_size = np.interp(bd, bd_curve, self.grain_radii)
+                grain_size = np.interp(bd, bd_curve, grain_radii_1d)
                 return grain_size
         
         # Use map_blocks instead of vectorize (removed in newer Dask)

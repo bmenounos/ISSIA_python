@@ -21,6 +21,8 @@ from typing import Tuple, Dict, Optional
 import warnings
 import time
 import sys
+from scipy.signal import savgol_filter
+
 
 # Import the base processor
 from issia import ISSIAProcessor
@@ -199,16 +201,27 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         
         # Read input files (with subset if specified)
         data = self.read_atcor_files(data_dir, flight_line, subset=subset)
+
         
+
         # Extract arrays and metadata
         reflectance = data['reflectance']
+    
         global_flux = data['global_flux']
         slope = data['slope']
         aspect = data['aspect']
         solar_zenith = data['solar_zenith']
         transform = data['transform']
         crs = data['crs']
+
+        reflectance = da.map_blocks(
+            lambda x: savgol_filter(x, window_length=11, polyorder=2, axis=0),
+            reflectance, dtype=reflectance.dtype
+        )
+
+
         
+
         # Use solar azimuth from file if not provided
         if solar_azimuth is None:
             solar_azimuth = data['solar_azimuth']
@@ -235,7 +248,11 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         )
         step_time = time.time() - step_start
         self._print(f"  ✓ Completed in {step_time:.1f}s", level='SUCCESS')
-        
+
+        reflectance = reflectance * 10000
+
+        print(f"Check: non-NaN pixels = {(~da.isnan(reflectance)).sum().compute()}")
+
         # Step 2: Calculate scaled band depth for each pixel
         step_start = time.time()
         self._print("Step 2/6: Calculating scaled band depths...")
@@ -258,11 +275,34 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         # Step 3: Retrieve grain size
         step_start = time.time()
         self._print("Step 3/6: Retrieving grain sizes from lookup tables...")
+        
         grain_size = self.retrieve_grain_size(band_depths, local_illum, 
                                              viewing_angle, 0.0)
+        
         step_time = time.time() - step_start
         self._print(f"  ✓ Grain size retrieval configured in {step_time:.1f}s", level='SUCCESS')
-        
+
+        reflectance = reflectance / 10000
+
+
+        spec = reflectance[:, 25, 25].compute()
+
+        idx_830 = np.argmin(np.abs(self.wavelengths - 830))
+        idx_1030 = np.argmin(np.abs(self.wavelengths - 1030))
+        idx_1130 = np.argmin(np.abs(self.wavelengths - 1130))
+
+        print(f"Raw spectrum values:")
+        print(f"  830nm: {spec[idx_830]:.6f}")
+        print(f"  1030nm: {spec[idx_1030]:.6f}")
+        print(f"  1130nm: {spec[idx_1130]:.6f}")
+        print(f"  Min in 830-1130: {spec[idx_830:idx_1130+1].min():.6f}")
+        print(f"  Max in 830-1130: {spec[idx_830:idx_1130+1].max():.6f}")
+
+        print(f"Actual wavelengths used:")
+        print(f"  Index {idx_830}: {self.wavelengths[idx_830]:.1f} nm")
+        print(f"  Index {idx_1030}: {self.wavelengths[idx_1030]:.1f} nm")  
+        print(f"  Index {idx_1130}: {self.wavelengths[idx_1130]:.1f} nm")
+
         # Step 4: Calculate anisotropy factor
         step_start = time.time()
         self._print("Step 4/6: Calculating anisotropy factors...")
@@ -330,9 +370,6 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         broadband_albedo_result = results_computed['broadband_albedo']
         rf_lap_result = results_computed['radiative_forcing']
         
-        # DEBUG: Check intermediate values
-        print("\n" + "="*70)
-        print("DEBUG DIAGNOSTICS:")
         print("="*70)
         
         # Check reflectance
@@ -365,6 +402,13 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         print(f"Broadband albedo range: {np.nanmin(bba_sample):.4f} - {np.nanmax(bba_sample):.4f}")
         
         print("="*70 + "\n")
+
+        bd_sample = band_depths.compute()
+        print(f"LUT BD: {self.sbd_lut.min():.6f} - {self.sbd_lut.max():.6f}")
+        
+        print(f"Data BD: {np.nanmin(bd_sample):.6f} - {np.nanmax(bd_sample):.6f}")
+
+      
         
         # Quick statistics
         print("\nRETRIEVAL STATISTICS:")
@@ -465,10 +509,10 @@ if __name__ == "__main__":
     # Initialize with verbosity
     processor = ISSIAProcessorNotebook(
         wavelengths=np.linspace(380, 2500, 451),
-        grain_radii=np.logspace(np.log10(30), np.log10(5000), 50),
-        illumination_angles=np.arange(0, 85, 5),
-        viewing_angles=np.arange(0, 65, 5),
-        relative_azimuths=np.arange(0, 185, 15),
+        grain_radii=np.arange(30, 5001, 30),
+        illumination_angles=np.arange(0, 86, 5),
+        viewing_angles=np.arange(0, 86, 5),
+        relative_azimuths=np.arange(0, 361, 10),
         coord_ref_sys_code=32610,
         chunk_size=(512, 512),
         verbose=True  # Enable progress messages

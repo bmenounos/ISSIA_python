@@ -85,13 +85,14 @@ class ISSIALUTGenerator:
         total = (len(self.illumination_angles) * len(self.viewing_angles) * 
                 len(self.relative_azimuths))
         count = 0
+        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for i, illum in enumerate(self.illumination_angles):
             for j, view in enumerate(self.viewing_angles):
                 for k, azim in enumerate(self.relative_azimuths):
                     count += 1
-                    if count % 10 == 0:
-                        print(f"Progress: {count}/{total} geometries")
+                    if count in milestones:
+                        print(f"Progress: {int(100 * count / total)}%")
                     
                     # Simulate reflectance for this geometry at all grain sizes
                     for g, grain_size in enumerate(self.grain_radii):
@@ -192,14 +193,15 @@ class ISSIALUTGenerator:
         # Compute with progress tracking
         total = len(illum_idx) * len(view_idx) * len(azim_idx) * len(grain_idx)
         count = 0
+        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for i in illum_idx:
             for j in view_idx:
                 for k in azim_idx:
                     for g in grain_idx:
                         count += 1
-                        if count % 100 == 0:
-                            print(f"Progress: {count}/{total} ({100*count/total:.1f}%)")
+                        if count in milestones:
+                            print(f"Progress: {int(100 * count / total)}%")
                         
                         anisotropy_lut[i, j, k, g, :] = compute_chunk(i, j, k, g)
         
@@ -211,14 +213,15 @@ class ISSIALUTGenerator:
         
         total = np.prod(shape[:4])
         count = 0
+        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for i, illum in enumerate(self.illumination_angles):
             for j, view in enumerate(self.viewing_angles):
                 for k, azim in enumerate(self.relative_azimuths):
                     for g, grain in enumerate(self.grain_radii):
                         count += 1
-                        if count % 100 == 0:
-                            print(f"Progress: {count}/{total}")
+                        if count in milestones:
+                            print(f"Progress: {int(100 * count / total)}%")
                         
                         # Directional reflectance
                         directional = self._simulate_snow_reflectance(
@@ -255,10 +258,11 @@ class ISSIALUTGenerator:
         print("Generating White-Sky Albedo LUT...")
         
         albedo_lut = np.zeros((len(self.grain_radii), len(self.wavelengths)))
+        milestones = [int(len(self.grain_radii) * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for g, grain_size in enumerate(self.grain_radii):
-            if (g+1) % 10 == 0:
-                print(f"Progress: {g+1}/{len(self.grain_radii)} grain sizes")
+            if (g+1) in milestones:
+                print(f"Progress: {int(100 * (g+1) / len(self.grain_radii))}%")
             
             # Simulate white-sky albedo
             albedo_lut[g, :] = self._simulate_snow_albedo(grain_size)
@@ -269,76 +273,110 @@ class ISSIALUTGenerator:
         
         return albedo_lut
     
+    def _load_ice_refractive_index(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Load Warren 2008 ice refractive index and resample to sensor wavelengths"""
+        # Load refractive index data
+        data = np.loadtxt('IOP_2008_ASCIItable.txt')
+        
+        # Extract 350-2600 nm range (MATLAB lines 97:265 → Python 96:265)
+        wvl_ri = data[96:265, 0] * 1000  # microns to nm
+        n_real = data[96:265, 1]
+        n_imag = data[96:265, 2]
+        
+        # Resample to sensor wavelengths
+        n_real_rs = np.interp(self.wavelengths, wvl_ri, n_real)
+        n_imag_rs = np.interp(self.wavelengths, wvl_ri, n_imag)
+        
+        return n_real_rs, n_imag_rs
+    
+    def _brf0(self, theta_i: float, theta_v: float, phi: float) -> float:
+        """Calculate r0 (Kokhanovsky & Brieglieb 2012)"""
+        new_phi = np.pi - phi
+        theta = np.arccos(-np.cos(theta_i) * np.cos(theta_v) + 
+                         np.sin(theta_i) * np.sin(theta_v) * np.cos(new_phi))
+        theta_deg = np.rad2deg(theta)
+        
+        phase = 11.1 * np.exp(-0.087 * theta_deg) + 1.1 * np.exp(-0.014 * theta_deg)
+        rr = 1.247 + 1.186 * (np.cos(theta_i) + np.cos(theta_v)) + \
+             5.157 * (np.cos(theta_i) * np.cos(theta_v)) + phase
+        rr = rr / (4 * (np.cos(theta_i) + np.cos(theta_v)))
+        return rr
+    
     def _simulate_snow_reflectance(self,
                                   grain_size: float,
                                   illumination: float,
                                   viewing: float,
                                   relative_azimuth: float) -> np.ndarray:
         """
-        Simulate directional snow reflectance using ART model
-        
-        Uses the Asymptotic Radiative Transfer (ART) model from 
-        Kokhanovsky & Zege (2004) for accurate snow/ice reflectance.
-        
-        Parameters:
-        -----------
-        grain_size : float
-            Effective grain radius (micrometers)
-        illumination : float
-            Illumination angle (degrees from zenith)
-        viewing : float
-            Viewing angle (degrees from zenith)
-        relative_azimuth : float
-            Relative azimuth angle (degrees)
-            
-        Returns:
-        --------
-        reflectance : np.ndarray
-            Spectral BRDF [n_wavelengths]
+        Simulate snow BRF using Kokhanovsky & Brieglieb 2012 ART model
         """
-        # Use ART model for physically accurate simulation
-        reflectance = simulate_snow_reflectance(
-            wavelengths=self.wavelengths,
-            grain_size_um=grain_size,
-            solar_zenith=illumination,
-            view_zenith=viewing,
-            relative_azimuth=relative_azimuth,
-            impurity_type=None,  # Clean snow for LUTs
-            impurity_conc=0.0
-        )
+        if not hasattr(self, '_n_real'):
+            self._n_real, self._n_imag = self._load_ice_refractive_index()
         
-        return reflectance
+        # Convert to radians
+        theta_i = np.deg2rad(illumination)
+        theta_v = np.deg2rad(viewing)
+        phi = np.deg2rad(relative_azimuth)
+        
+        # Convert grain size microns→meters
+        opt_radius = grain_size * 1e-6
+        
+        # Constants
+        b = 13  # L = 13d
+        M = 0   # Clean snow
+        
+        # r0
+        r0 = self._brf0(theta_i, theta_v, phi)
+        
+        # k0 factors
+        k0v = (3.0 / 7.0) * (1 + 2 * np.cos(theta_v))
+        k0i = (3.0 / 7.0) * (1 + 2 * np.cos(theta_i))
+        
+        # Wavelengths nm→m
+        wvl_m = self.wavelengths * 1e-9
+
+        # BRF calculation
+        gamma = 4 * np.pi * (self._n_imag + M) / wvl_m
+        alpha = np.sqrt(gamma * b * 2 * opt_radius)
+        brf = r0 * np.exp(-alpha * k0i * k0v / r0)
+
+    
+        return brf
     
     def _simulate_snow_albedo(self, grain_size: float) -> np.ndarray:
         """
-        Simulate hemispherical (white-sky) snow albedo using ART model
-        
-        Uses the Asymptotic Radiative Transfer (ART) model for
-        accurate spherical albedo calculation.
-        
-        Parameters:
-        -----------
-        grain_size : float
-            Effective grain radius (micrometers)
-            
-        Returns:
-        --------
-        albedo : np.ndarray
-            Spectral albedo [n_wavelengths]
+        Simulate hemispherical albedo using ART model
         """
-        # Use ART model for hemispherical albedo
-        albedo = simulate_snow_albedo(
-            wavelengths=self.wavelengths,
-            grain_size_um=grain_size,
-            impurity_type=None,  # Clean snow for LUTs
-            impurity_conc=0.0
-        )
+        if not hasattr(self, '_n_real'):
+            self._n_real, self._n_imag = self._load_ice_refractive_index()
+        
+        # Use nadir viewing for albedo approximation
+        theta_i = np.deg2rad(0)
+        theta_v = np.deg2rad(0)
+        phi = np.deg2rad(0)
+        
+        opt_radius = grain_size * 1e-6
+        b = 13
+        M = 0
+        
+        r0 = self._brf0(theta_i, theta_v, phi)
+        k0v = (3.0 / 7.0) * (1 + 2 * np.cos(theta_v))
+        k0i = (3.0 / 7.0) * (1 + 2 * np.cos(theta_i))
+        
+        wvl_m = self.wavelengths * 1e-9
+        gamma = 4 * np.pi * (self._n_imag + M) / wvl_m
+        alpha = np.sqrt(gamma * b * 2 * opt_radius)
+        
+        # Albedo (Kokhanovsky & Schreier 2009)
+        Q = (k0i * k0v) / r0
+        brf = r0 * np.exp(-alpha * k0i * k0v / r0)
+        albedo = np.exp(-1/Q * np.log(r0/brf))
         
         return albedo
     
     def _calculate_band_depth(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
         """
-        Calculate continuum-removed band depth for 1030 nm feature
+        Calculate continuum-removed band depth for 1030 nm feature using convex hull
         
         Parameters:
         -----------
@@ -352,26 +390,42 @@ class ISSIALUTGenerator:
         band_depth : float
             Scaled band depth at 1030 nm
         """
-        # Find wavelength indices
-        left_idx = np.argmin(np.abs(self.wavelengths - 950))
-        center_idx = np.argmin(np.abs(self.wavelengths - 1030))
+        from scipy.spatial import ConvexHull
         
-        # Find local maximum around 1100 nm
-        search_start = np.argmin(np.abs(self.wavelengths - 1080))
-        search_end = np.argmin(np.abs(self.wavelengths - 1120))
-        local_max_idx = search_start + np.argmax(spectrum[search_start:search_end])
+        # Extract 900-1130nm range (matches MATLAB driver_ART_LUT_generator.m)
+        #left_idx = np.argmin(np.abs(self.wavelengths - 900))
+        left_idx = np.argmin(np.abs(self.wavelengths - 830))
+        right_idx = np.argmin(np.abs(self.wavelengths - 1130))
         
-        # Create continuum line
-        wl_continuum = [self.wavelengths[left_idx], self.wavelengths[local_max_idx]]
-        r_continuum = [spectrum[left_idx], spectrum[local_max_idx]]
+        wl_subset = self.wavelengths[left_idx:right_idx+1]
+        spec_subset = spectrum[left_idx:right_idx+1]
         
-        continuum = np.interp(self.wavelengths, wl_continuum, r_continuum)
+        # Apply convex hull method
+        spec_ext = np.concatenate([[0], spec_subset, [0]])
+        x_ext = np.arange(len(spec_ext))
         
-        # Continuum removal
-        continuum_removed = spectrum / (continuum + 1e-10)
+        points = np.column_stack([x_ext, spec_ext])
+        try:
+            hull = ConvexHull(points)
+            
+            K = hull.vertices.copy()
+            K = K[2:]   # Remove first 2
+            K = K[:-1]  # Remove last
+            K = np.sort(K)  # Sort
+            K = K - 1   # Adjust indices
+            
+            continuum = np.interp(np.arange(len(spec_subset)), K, spec_subset[K])
+            continuum = np.where(continuum < 1e-10, 1e-10, continuum)
+            
+            continuum_removed = spec_subset / continuum
+            
+        except:
+            # Fallback
+            continuum = np.linspace(spec_subset[0], spec_subset[-1], len(spec_subset))
+            continuum_removed = spec_subset / (continuum + 1e-10)
         
-        # Band depth at 1030 nm
-        band_depth = 1.0 - continuum_removed[center_idx]
+        # Band depth as min of CR spectrum (matches MATLAB)
+        band_depth = 1.0 - continuum_removed.min()
         
         return continuum_removed, band_depth
 
@@ -381,18 +435,30 @@ def main():
     Example LUT generation
     """
     from pathlib import Path
+
+    import spectral.io.envi as envi
+
+
+    data_dir = Path('/Volumes/aco-uvic/2022_Acquisitions/02_Processed/22_4012_07_PlaceGlacier/03_Hyper/02_Working/OUTPUT/subsets/')
+    flight_line = '22_4012_07_2022-08-07_19-54-01-rect_img'
+    
+    hdr = envi.open(f"{data_dir}/{flight_line}_atm.hdr")
+    wvl = [float(w) for w in hdr.metadata['wavelength']]
+    
+    wavelengths = np.array([float(w) for w in hdr.metadata['wavelength']])
+
     
     # Define parameters to match your instrument
     # Example: AisaFENIX spectrometer (380-2500 nm, 451 bands)
-    wavelengths = np.linspace(380, 2500, 451)
+    #wavelengths = np.linspace(380, 2500, 451)
     
-    # Grain size range: 30-5000 micrometers (logarithmic spacing)
-    grain_radii = np.logspace(np.log10(30), np.log10(5000), 50)
+    # Grain size range: 30-5000 micrometers (linear spacing, 30 μm steps)
+    grain_radii = np.arange(30, 5001, 30)  # Matches MATLAB: 30:30:5000
     
-    # Angular grids (balance resolution with computation time)
-    illumination_angles = np.arange(0, 85, 5)  # 0-80° in 5° steps
-    viewing_angles = np.arange(0, 65, 5)  # 0-60° in 5° steps
-    relative_azimuths = np.arange(0, 185, 15)  # 0-180° in 15° steps
+    # Angular grids (match MATLAB ISSIA)
+    illumination_angles = np.arange(0, 86, 5)  # 0:5:85 = 18 values
+    viewing_angles = np.arange(0, 86, 5)       # 0:5:85 = 18 values  
+    relative_azimuths = np.arange(0, 361, 10)  # 0:10:360 = 37 values
     
     print("Initializing LUT Generator...")
     print(f"Wavelengths: {len(wavelengths)}")
