@@ -21,8 +21,6 @@ from typing import Tuple, Dict, Optional
 import warnings
 import time
 import sys
-from scipy.signal import savgol_filter
-
 
 # Import the base processor
 from issia import ISSIAProcessor
@@ -201,27 +199,16 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         
         # Read input files (with subset if specified)
         data = self.read_atcor_files(data_dir, flight_line, subset=subset)
-
         
-
         # Extract arrays and metadata
         reflectance = data['reflectance']
-    
         global_flux = data['global_flux']
         slope = data['slope']
         aspect = data['aspect']
         solar_zenith = data['solar_zenith']
         transform = data['transform']
         crs = data['crs']
-
-        reflectance = da.map_blocks(
-            lambda x: savgol_filter(x, window_length=11, polyorder=2, axis=0),
-            reflectance, dtype=reflectance.dtype
-        )
-
-
         
-
         # Use solar azimuth from file if not provided
         if solar_azimuth is None:
             solar_azimuth = data['solar_azimuth']
@@ -248,11 +235,22 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         )
         step_time = time.time() - step_start
         self._print(f"  ✓ Completed in {step_time:.1f}s", level='SUCCESS')
-
-        reflectance = reflectance * 10000
-
-        print(f"Check: non-NaN pixels = {(~da.isnan(reflectance)).sum().compute()}")
-
+        
+        # Apply NDSI snow/ice mask
+        step_start = time.time()
+        self._print("Applying NDSI snow/ice mask...")
+        snow_mask = self.calculate_ndsi(reflectance)
+        
+        # Count snow pixels
+        snow_fraction = (snow_mask.sum() / snow_mask.size).compute()
+        self._print(f"  Snow/ice fraction: {100*snow_fraction:.1f}%")
+        
+        # Mask non-snow pixels (set to NaN)
+        reflectance = da.where(snow_mask, reflectance, np.nan)
+        
+        step_time = time.time() - step_start
+        self._print(f"  ✓ NDSI masking completed in {step_time:.1f}s", level='SUCCESS')
+        
         # Step 2: Calculate scaled band depth for each pixel
         step_start = time.time()
         self._print("Step 2/6: Calculating scaled band depths...")
@@ -282,27 +280,13 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         step_time = time.time() - step_start
         self._print(f"  ✓ Grain size retrieval configured in {step_time:.1f}s", level='SUCCESS')
 
-        reflectance = reflectance / 10000
+        if da.isnan(grain_size).all().compute():
+            print("No valid snow/ice pixels found, skipping anisotropy")
+            anisotropy = da.ones_like(reflectance)
+        else:
+            anisotropy = self.calculate_anisotropy_factor(...)
 
-
-        spec = reflectance[:, 25, 25].compute()
-
-        idx_830 = np.argmin(np.abs(self.wavelengths - 830))
-        idx_1030 = np.argmin(np.abs(self.wavelengths - 1030))
-        idx_1130 = np.argmin(np.abs(self.wavelengths - 1130))
-
-        print(f"Raw spectrum values:")
-        print(f"  830nm: {spec[idx_830]:.6f}")
-        print(f"  1030nm: {spec[idx_1030]:.6f}")
-        print(f"  1130nm: {spec[idx_1130]:.6f}")
-        print(f"  Min in 830-1130: {spec[idx_830:idx_1130+1].min():.6f}")
-        print(f"  Max in 830-1130: {spec[idx_830:idx_1130+1].max():.6f}")
-
-        print(f"Actual wavelengths used:")
-        print(f"  Index {idx_830}: {self.wavelengths[idx_830]:.1f} nm")
-        print(f"  Index {idx_1030}: {self.wavelengths[idx_1030]:.1f} nm")  
-        print(f"  Index {idx_1130}: {self.wavelengths[idx_1130]:.1f} nm")
-
+    
         # Step 4: Calculate anisotropy factor
         step_start = time.time()
         self._print("Step 4/6: Calculating anisotropy factors...")
@@ -402,13 +386,6 @@ class ISSIAProcessorNotebook(ISSIAProcessor):
         print(f"Broadband albedo range: {np.nanmin(bba_sample):.4f} - {np.nanmax(bba_sample):.4f}")
         
         print("="*70 + "\n")
-
-        bd_sample = band_depths.compute()
-        print(f"LUT BD: {self.sbd_lut.min():.6f} - {self.sbd_lut.max():.6f}")
-        
-        print(f"Data BD: {np.nanmin(bd_sample):.6f} - {np.nanmax(bd_sample):.6f}")
-
-      
         
         # Quick statistics
         print("\nRETRIEVAL STATISTICS:")

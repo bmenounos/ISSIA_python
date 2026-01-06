@@ -232,6 +232,33 @@ class ISSIAProcessor:
             
         return solar_zenith, solar_azimuth
     
+    def calculate_ndsi(self, reflectance: da.Array) -> da.Array:
+        """
+        Calculate Normalized Difference Snow Index
+        
+        NDSI = (Green - SWIR) / (Green + SWIR)
+        Uses 600nm (green) and 1500nm (SWIR) per Painter et al 2013
+        
+        Returns:
+        --------
+        snow_mask : da.Array
+            Boolean mask where True = snow/ice (NDSI > 0.87)
+        """
+        # Find wavelength indices
+        green_idx = np.argmin(np.abs(self.wavelengths - 600))
+        swir_idx = np.argmin(np.abs(self.wavelengths - 1500))
+        
+        green = reflectance[green_idx, :, :]
+        swir = reflectance[swir_idx, :, :]
+        
+        ndsi = (green - swir) / (green + swir + 1e-10)
+        
+        # NDSI threshold for snow/ice (0.87 per MATLAB)
+        # Also mask pixels with zero SWIR reflectance
+        snow_mask = (ndsi > 0.87) & (swir > 0)
+        
+        return snow_mask
+    
     def continuum_removal(self, spectrum: np.ndarray, 
                          wavelengths: np.ndarray,
                          left_wl: float = 900.0,
@@ -302,11 +329,7 @@ class ISSIAProcessor:
             continuum_removed = spec_subset / continuum
         
         # Calculate band depth as min of CR spectrum (matches MATLAB)
-        #band_depth = 1.0 - continuum_removed.min()
-
-        center_idx = np.argmin(np.abs(wl_subset - 1030))
-        band_depth = 1.0 - continuum_removed[center_idx]
-
+        band_depth = 1.0 - continuum_removed.min()
         
         return continuum_removed, band_depth
     
@@ -402,14 +425,16 @@ class ISSIAProcessor:
                 # Interpolate
                 grain_size = np.interp(bd, bd_curve, grain_radii_1d)
                 return grain_size
-        
-        # Use map_blocks instead of vectorize (removed in newer Dask)
+
         def lookup_wrapper(bd_block, illum_block):
-            result = np.zeros_like(bd_block, dtype=float)
-            for i in range(bd_block.shape[0]):
-                for j in range(bd_block.shape[1]):
+            min_i = min(bd_block.shape[0], illum_block.shape[0])
+            min_j = min(bd_block.shape[1], illum_block.shape[1])
+            result = np.zeros((min_i, min_j), dtype=float)
+            for i in range(min_i):
+                for j in range(min_j):
                     result[i, j] = lookup_grain_size(bd_block[i, j], illum_block[i, j])
             return result
+    
         
         grain_size = da.map_blocks(lookup_wrapper, 
                                    band_depth_map, 
