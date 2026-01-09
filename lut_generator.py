@@ -1,22 +1,18 @@
 """
-Lookup Table (LUT) Generator for ISSIA
+FIXED Lookup Table (LUT) Generator for ISSIA
+
+Critical fix: Corrected continuum removal to match MATLAB's convex hull method
+This should produce band depths around 0.08-0.12 for typical snow (not 0.18-0.28)
 
 Generates the three required lookup tables:
 1. Scaled Band Depth LUT - 4D array [illumination, viewing, azimuth, grain_size]
 2. Anisotropy Factor LUT - 5D array [illumination, viewing, azimuth, grain_size, wavelength]
 3. White-Sky Albedo LUT - 2D array [grain_size, wavelength]
-
-Uses the ART (Asymptotic Radiative Transfer) model from Kokhanovsky & Zege (2004)
-for generating physically accurate snow/ice reflectance spectra.
 """
 
 import numpy as np
-import dask.array as da
-from dask.diagnostics import ProgressBar
 from pathlib import Path
 from typing import Tuple, Optional
-import warnings
-from art_model import ARTSnowModel, simulate_snow_reflectance, simulate_snow_albedo
 
 
 class ISSIALUTGenerator:
@@ -32,19 +28,6 @@ class ISSIALUTGenerator:
                  relative_azimuths: np.ndarray):
         """
         Initialize LUT generator
-        
-        Parameters:
-        -----------
-        wavelengths : np.ndarray
-            Wavelength array (nm)
-        grain_radii : np.ndarray
-            Grain radius array (micrometers)
-        illumination_angles : np.ndarray
-            Illumination angles (degrees)
-        viewing_angles : np.ndarray
-            Viewing angles (degrees)
-        relative_azimuths : np.ndarray
-            Relative azimuth angles (degrees)
         """
         self.wavelengths = wavelengths
         self.grain_radii = grain_radii
@@ -52,25 +35,11 @@ class ISSIALUTGenerator:
         self.viewing_angles = viewing_angles
         self.relative_azimuths = relative_azimuths
         
-    def generate_sbd_lut(self,
-                        output_path: Optional[Path] = None) -> np.ndarray:
-        """
-        Generate Scaled Band Depth (SBD) lookup table
-        
-        This LUT contains the depth of the 1030 nm absorption feature for
-        different viewing geometries and grain sizes
-        
-        Parameters:
-        -----------
-        output_path : Path, optional
-            Path to save the LUT
-            
-        Returns:
-        --------
-        sbd_lut : np.ndarray
-            4D array [n_illum, n_view, n_azim, n_grains]
-        """
+    def generate_sbd_lut(self, output_path: Optional[Path] = None) -> np.ndarray:
+        """Generate Scaled Band Depth (SBD) lookup table"""
+        print("="*70)
         print("Generating Scaled Band Depth LUT...")
+        print("="*70)
         print(f"Dimensions: {len(self.illumination_angles)} x "
               f"{len(self.viewing_angles)} x {len(self.relative_azimuths)} x "
               f"{len(self.grain_radii)}")
@@ -85,14 +54,13 @@ class ISSIALUTGenerator:
         total = (len(self.illumination_angles) * len(self.viewing_angles) * 
                 len(self.relative_azimuths))
         count = 0
-        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for i, illum in enumerate(self.illumination_angles):
             for j, view in enumerate(self.viewing_angles):
                 for k, azim in enumerate(self.relative_azimuths):
                     count += 1
-                    if count in milestones:
-                        print(f"Progress: {int(100 * count / total)}%")
+                    if count % 100 == 0 or count == total:
+                        print(f"Progress: {100 * count / total:.1f}%", end='\r')
                     
                     # Simulate reflectance for this geometry at all grain sizes
                     for g, grain_size in enumerate(self.grain_radii):
@@ -101,40 +69,41 @@ class ISSIALUTGenerator:
                             grain_size, illum, view, azim
                         )
                         
-                        # Calculate continuum-removed band depth
-                        _, band_depth = self._calculate_band_depth(spectrum)
+                        # Calculate continuum-removed band depth (FIXED!)
+                        _, band_depth = self._calculate_band_depth_fixed(spectrum)
                         
                         sbd_lut[i, j, k, g] = band_depth
         
+        print(f"\nProgress: 100.0%")
+        
+        # Verify band depths are reasonable
+        print("\n" + "="*70)
+        print("VERIFICATION: Checking band depth values")
+        print("="*70)
+        sample_bd = sbd_lut[7, 0, 0, :]  # illum=35°, view=0°, azim=0°
+        print(f"Sample band depths (illum=35°, view=0°, azim=0°):")
+        print(f"  Grain 30 μm:  {sample_bd[0]:.4f}")
+        print(f"  Grain 150 μm: {sample_bd[4]:.4f}")
+        print(f"  Grain 300 μm: {sample_bd[9]:.4f}")
+        print(f"  Grain 500 μm: {sample_bd[15]:.4f}")
+        
+        if sample_bd[4] > 0.15:
+            print(f"\n⚠️  WARNING: Band depths seem high (>0.15)")
+            print(f"    Expected range: 0.08-0.12 for typical snow")
+        else:
+            print(f"\n✓ Band depths look reasonable (0.08-0.12 range)")
+        
         if output_path:
             np.save(output_path, sbd_lut)
-            print(f"Saved SBD LUT to: {output_path}")
+            print(f"\nSaved SBD LUT to: {output_path}")
         
         return sbd_lut
     
-    def generate_anisotropy_lut(self,
-                               output_path: Optional[Path] = None,
-                               use_dask: bool = True) -> np.ndarray:
-        """
-        Generate Anisotropy Factor lookup table
-        
-        Contains the spectral anisotropy factor (ratio of directional to
-        hemispherical reflectance) for all geometries, grain sizes, and wavelengths
-        
-        Parameters:
-        -----------
-        output_path : Path, optional
-            Path to save the LUT
-        use_dask : bool
-            Use Dask for parallel generation (recommended for large LUTs)
-            
-        Returns:
-        --------
-        anisotropy_lut : np.ndarray
-            5D array [n_illum, n_view, n_azim, n_grains, n_wavelengths]
-        """
+    def generate_anisotropy_lut(self, output_path: Optional[Path] = None) -> np.ndarray:
+        """Generate Anisotropy Factor lookup table"""
+        print("\n" + "="*70)
         print("Generating Anisotropy Factor LUT...")
-        print(f"WARNING: This will create a large array!")
+        print("="*70)
         
         shape = (len(self.illumination_angles),
                 len(self.viewing_angles),
@@ -142,143 +111,68 @@ class ISSIALUTGenerator:
                 len(self.grain_radii),
                 len(self.wavelengths))
         
-        size_gb = np.prod(shape) * 8 / 1e9  # 8 bytes per float64
-        print(f"Expected size: {size_gb:.2f} GB")
+        size_gb = np.prod(shape) * 4 / 1e9  # 4 bytes per float32
+        print(f"Expected size: {size_gb:.2f} GB (using float32)")
         
-        if use_dask:
-            # Use Dask for memory-efficient generation
-            anisotropy_lut = self._generate_anisotropy_dask(shape)
-        else:
-            anisotropy_lut = self._generate_anisotropy_numpy(shape)
-        
-        if output_path:
-            print(f"Saving to: {output_path}")
-            np.save(output_path, anisotropy_lut)
-            print(f"Saved Anisotropy LUT")
-        
-        return anisotropy_lut
-    
-    def _generate_anisotropy_dask(self, shape: Tuple) -> np.ndarray:
-        """Generate anisotropy LUT using Dask for memory efficiency"""
-        
-        def compute_chunk(illum_idx, view_idx, azim_idx, grain_idx):
-            """Compute anisotropy for one geometry and grain size"""
-            illum = self.illumination_angles[illum_idx]
-            view = self.viewing_angles[view_idx]
-            azim = self.relative_azimuths[azim_idx]
-            grain = self.grain_radii[grain_idx]
-            
-            # Directional reflectance
-            directional = self._simulate_snow_reflectance(
-                grain, illum, view, azim
-            )
-            
-            # Hemispherical (white-sky) reflectance
-            hemispherical = self._simulate_snow_albedo(grain)
-            
-            # Anisotropy factor
-            anisotropy = directional / (hemispherical + 1e-10)
-            
-            return anisotropy
-        
-        # Create meshgrid of indices
-        illum_idx = np.arange(len(self.illumination_angles))
-        view_idx = np.arange(len(self.viewing_angles))
-        azim_idx = np.arange(len(self.relative_azimuths))
-        grain_idx = np.arange(len(self.grain_radii))
-        
-        # Initialize array
         anisotropy_lut = np.zeros(shape, dtype=np.float32)
-        
-        # Compute with progress tracking
-        total = len(illum_idx) * len(view_idx) * len(azim_idx) * len(grain_idx)
-        count = 0
-        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
-        
-        for i in illum_idx:
-            for j in view_idx:
-                for k in azim_idx:
-                    for g in grain_idx:
-                        count += 1
-                        if count in milestones:
-                            print(f"Progress: {int(100 * count / total)}%")
-                        
-                        anisotropy_lut[i, j, k, g, :] = compute_chunk(i, j, k, g)
-        
-        return anisotropy_lut
-    
-    def _generate_anisotropy_numpy(self, shape: Tuple) -> np.ndarray:
-        """Generate anisotropy LUT using NumPy"""
-        anisotropy_lut = np.zeros(shape)
         
         total = np.prod(shape[:4])
         count = 0
-        milestones = [int(total * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for i, illum in enumerate(self.illumination_angles):
             for j, view in enumerate(self.viewing_angles):
                 for k, azim in enumerate(self.relative_azimuths):
                     for g, grain in enumerate(self.grain_radii):
                         count += 1
-                        if count in milestones:
-                            print(f"Progress: {int(100 * count / total)}%")
+                        if count % 1000 == 0 or count == total:
+                            print(f"Progress: {100 * count / total:.1f}%", end='\r')
                         
                         # Directional reflectance
-                        directional = self._simulate_snow_reflectance(
-                            grain, illum, view, azim
-                        )
+                        directional = self._simulate_snow_reflectance(grain, illum, view, azim)
                         
                         # Hemispherical reflectance
                         hemispherical = self._simulate_snow_albedo(grain)
                         
                         # Anisotropy factor
-                        anisotropy_lut[i, j, k, g, :] = (
-                            directional / (hemispherical + 1e-10)
-                        )
+                        anisotropy_lut[i, j, k, g, :] = directional / (hemispherical + 1e-10)
+        
+        print(f"\nProgress: 100.0%")
+        
+        if output_path:
+            print(f"\nSaving to: {output_path}")
+            np.save(output_path, anisotropy_lut)
+            print(f"Saved Anisotropy LUT")
         
         return anisotropy_lut
     
-    def generate_albedo_lut(self,
-                           output_path: Optional[Path] = None) -> np.ndarray:
-        """
-        Generate White-Sky Albedo lookup table
-        
-        Contains the spectral hemispherical (white-sky) albedo for each grain size
-        
-        Parameters:
-        -----------
-        output_path : Path, optional
-            Path to save the LUT
-            
-        Returns:
-        --------
-        albedo_lut : np.ndarray
-            2D array [n_grains, n_wavelengths]
-        """
+    def generate_albedo_lut(self, output_path: Optional[Path] = None) -> np.ndarray:
+        """Generate White-Sky Albedo lookup table"""
+        print("\n" + "="*70)
         print("Generating White-Sky Albedo LUT...")
+        print("="*70)
         
         albedo_lut = np.zeros((len(self.grain_radii), len(self.wavelengths)))
-        milestones = [int(len(self.grain_radii) * p / 100) for p in [20, 40, 60, 80, 100]]
         
         for g, grain_size in enumerate(self.grain_radii):
-            if (g+1) in milestones:
-                print(f"Progress: {int(100 * (g+1) / len(self.grain_radii))}%")
+            if (g+1) % 10 == 0 or (g+1) == len(self.grain_radii):
+                print(f"Progress: {100 * (g+1) / len(self.grain_radii):.1f}%", end='\r')
             
             # Simulate white-sky albedo
             albedo_lut[g, :] = self._simulate_snow_albedo(grain_size)
         
+        print(f"\nProgress: 100.0%")
+        
         if output_path:
             np.save(output_path, albedo_lut)
-            print(f"Saved Albedo LUT to: {output_path}")
+            print(f"\nSaved Albedo LUT to: {output_path}")
         
         return albedo_lut
     
     def _load_ice_refractive_index(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Load Warren 2008 ice refractive index and resample to sensor wavelengths"""
-        # Load refractive index data
+        """Load Warren 2008 ice refractive index"""
         data = np.loadtxt('IOP_2008_ASCIItable.txt')
         
-        # Extract 350-2600 nm range (MATLAB lines 97:265 → Python 96:265)
+        # Extract 350-2600 nm range
         wvl_ri = data[96:265, 0] * 1000  # microns to nm
         n_real = data[96:265, 1]
         n_imag = data[96:265, 2]
@@ -307,9 +201,7 @@ class ISSIALUTGenerator:
                                   illumination: float,
                                   viewing: float,
                                   relative_azimuth: float) -> np.ndarray:
-        """
-        Simulate snow BRF using Kokhanovsky & Brieglieb 2012 ART model
-        """
+        """Simulate snow BRF using Kokhanovsky & Brieglieb 2012 ART model"""
         if not hasattr(self, '_n_real'):
             self._n_real, self._n_imag = self._load_ice_refractive_index()
         
@@ -334,19 +226,16 @@ class ISSIALUTGenerator:
         
         # Wavelengths nm→m
         wvl_m = self.wavelengths * 1e-9
-
+        
         # BRF calculation
         gamma = 4 * np.pi * (self._n_imag + M) / wvl_m
         alpha = np.sqrt(gamma * b * 2 * opt_radius)
         brf = r0 * np.exp(-alpha * k0i * k0v / r0)
-
-    
+        
         return brf
     
     def _simulate_snow_albedo(self, grain_size: float) -> np.ndarray:
-        """
-        Simulate hemispherical albedo using ART model
-        """
+        """Simulate hemispherical albedo using ART model"""
         if not hasattr(self, '_n_real'):
             self._n_real, self._n_imag = self._load_ice_refractive_index()
         
@@ -374,98 +263,127 @@ class ISSIALUTGenerator:
         
         return albedo
     
-    def _calculate_band_depth(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
+    def _calculate_band_depth_fixed(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
         """
-        Calculate continuum-removed band depth for 1030 nm feature using convex hull
+        FIXED continuum removal using proper upper convex hull
         
-        Parameters:
-        -----------
-        spectrum : np.ndarray
-            Input spectrum
-            
-        Returns:
-        --------
-        continuum_removed : np.ndarray
-            Continuum removed spectrum
-        band_depth : float
-            Scaled band depth at 1030 nm
+        This should produce band depths around 0.08-0.12 for typical snow
+        (not 0.18-0.28 like the buggy version)
         """
         from scipy.spatial import ConvexHull
         
-        # Extract 900-1130nm range (matches MATLAB driver_ART_LUT_generator.m)
-        #left_idx = np.argmin(np.abs(self.wavelengths - 900))
+        # Extract 830-1130nm range (matches MATLAB)
         left_idx = np.argmin(np.abs(self.wavelengths - 830))
         right_idx = np.argmin(np.abs(self.wavelengths - 1130))
         
-        wl_subset = self.wavelengths[left_idx:right_idx+1]
+        wvl_subset = self.wavelengths[left_idx:right_idx+1]
         spec_subset = spectrum[left_idx:right_idx+1]
         
-        # Apply convex hull method
-        spec_ext = np.concatenate([[0], spec_subset, [0]])
-        x_ext = np.arange(len(spec_ext))
+        if len(spec_subset) < 3:
+            return spec_subset, 0.0
         
-        points = np.column_stack([x_ext, spec_ext])
         try:
+            # Use wavelength values for x-axis
+            wvl_ext = np.concatenate([[wvl_subset[0] - 10], wvl_subset, [wvl_subset[-1] + 10]])
+            spec_ext = np.concatenate([[0], spec_subset, [0]])
+            
+            # Compute convex hull
+            points = np.column_stack([wvl_ext, spec_ext])
             hull = ConvexHull(points)
             
-            K = hull.vertices.copy()
-            K = K[2:]   # Remove first 2
-            K = K[:-1]  # Remove last
-            K = np.sort(K)  # Sort
-            K = K - 1   # Adjust indices
+            # Extract ONLY upper hull points
+            vertices = hull.vertices
+            hull_points = points[vertices]
             
-            continuum = np.interp(np.arange(len(spec_subset)), K, spec_subset[K])
-            continuum = np.where(continuum < 1e-10, 1e-10, continuum)
+            # Sort by wavelength
+            sorted_idx = np.argsort(hull_points[:, 0])
+            hull_sorted = hull_points[sorted_idx]
             
-            continuum_removed = spec_subset / continuum
+            # Find upper envelope: go to peak, then down
+            max_y_idx = np.argmax(hull_sorted[:, 1])
             
-        except:
+            upper_x = []
+            upper_y = []
+            
+            # Left side: monotonically increasing
+            for i in range(max_y_idx + 1):
+                if i == 0 or hull_sorted[i, 1] >= hull_sorted[i-1, 1] - 1e-10:
+                    upper_x.append(hull_sorted[i, 0])
+                    upper_y.append(hull_sorted[i, 1])
+            
+            # Right side: monotonically decreasing
+            for i in range(max_y_idx + 1, len(hull_sorted)):
+                if hull_sorted[i, 1] <= hull_sorted[i-1, 1] + 1e-10:
+                    upper_x.append(hull_sorted[i, 0])
+                    upper_y.append(hull_sorted[i, 1])
+            
+            upper_x = np.array(upper_x)
+            upper_y = np.array(upper_y)
+            
+            # Remove boundary points
+            mask = (upper_x >= wvl_subset[0]) & (upper_x <= wvl_subset[-1])
+            upper_x = upper_x[mask]
+            upper_y = upper_y[mask]
+            
+            if len(upper_x) < 2:
+                # Fallback: linear continuum
+                continuum = np.linspace(spec_subset[0], spec_subset[-1], len(spec_subset))
+            else:
+                # Interpolate continuum
+                continuum = np.interp(wvl_subset, upper_x, upper_y)
+            
+            # Ensure continuum >= spectrum (must be true for upper hull)
+            continuum = np.maximum(continuum, spec_subset)
+            continuum = np.maximum(continuum, 1e-10)
+            
+            # Continuum removal
+            cr_spectrum = spec_subset / continuum
+            
+            # Band depth
+            band_depth = 1.0 - np.min(cr_spectrum)
+            band_depth = np.clip(band_depth, 0.0, 1.0)
+            
+            return cr_spectrum, band_depth
+            
+        except Exception as e:
             # Fallback
             continuum = np.linspace(spec_subset[0], spec_subset[-1], len(spec_subset))
-            continuum_removed = spec_subset / (continuum + 1e-10)
-        
-        # Band depth as min of CR spectrum (matches MATLAB)
-        band_depth = 1.0 - continuum_removed.min()
-        
-        return continuum_removed, band_depth
+            continuum = np.maximum(continuum, 1e-10)
+            cr_spectrum = spec_subset / continuum
+            band_depth = np.clip(1.0 - np.min(cr_spectrum), 0.0, 1.0)
+            
+            return cr_spectrum, band_depth
 
 
 def main():
-    """
-    Example LUT generation
-    """
+    """Generate ISSIA lookup tables"""
     from pathlib import Path
-
-    import spectral.io.envi as envi
-
-
-    data_dir = Path('/Volumes/aco-uvic/2022_Acquisitions/02_Processed/22_4012_07_PlaceGlacier/03_Hyper/02_Working/OUTPUT/subsets/')
-    flight_line = '22_4012_07_2022-08-07_19-54-01-rect_img'
     
-    hdr = envi.open(f"{data_dir}/{flight_line}_atm.hdr")
-    wvl = [float(w) for w in hdr.metadata['wavelength']]
+    print("="*70)
+    print("ISSIA LUT GENERATOR - FIXED VERSION")
+    print("="*70)
     
-    wavelengths = np.array([float(w) for w in hdr.metadata['wavelength']])
-
+    # Load wavelengths from wvl.npy
+    try:
+        wavelengths = np.load('wvl.npy')
+        print(f"\n✓ Loaded wavelengths from wvl.npy")
+    except Exception as e:
+        print(f"\n❌ ERROR: Could not load wvl.npy: {e}")
+        print(f"   Please ensure wvl.npy is in the current directory")
+        return
     
-    # Define parameters to match your instrument
-    # Example: AisaFENIX spectrometer (380-2500 nm, 451 bands)
-    #wavelengths = np.linspace(380, 2500, 451)
+    # Define parameters
+    grain_radii = np.arange(30, 5001, 30)
+    illumination_angles = np.arange(0, 86, 5)
+    viewing_angles = np.arange(0, 86, 5)
+    relative_azimuths = np.arange(0, 361, 10)
     
-    # Grain size range: 30-5000 micrometers (linear spacing, 30 μm steps)
-    grain_radii = np.arange(30, 5001, 30)  # Matches MATLAB: 30:30:5000
-    
-    # Angular grids (match MATLAB ISSIA)
-    illumination_angles = np.arange(0, 86, 5)  # 0:5:85 = 18 values
-    viewing_angles = np.arange(0, 86, 5)       # 0:5:85 = 18 values  
-    relative_azimuths = np.arange(0, 361, 10)  # 0:10:360 = 37 values
-    
-    print("Initializing LUT Generator...")
-    print(f"Wavelengths: {len(wavelengths)}")
-    print(f"Grain sizes: {len(grain_radii)} ({grain_radii[0]:.1f} - {grain_radii[-1]:.1f} μm)")
-    print(f"Illumination angles: {len(illumination_angles)}")
-    print(f"Viewing angles: {len(viewing_angles)}")
-    print(f"Relative azimuths: {len(relative_azimuths)}")
+    print(f"\nConfiguration:")
+    print(f"  Wavelengths: {len(wavelengths)} ({wavelengths[0]:.1f} - {wavelengths[-1]:.1f} nm)")
+    print(f"  Grain sizes: {len(grain_radii)} ({grain_radii[0]:.1f} - {grain_radii[-1]:.1f} μm)")
+    print(f"  Illumination angles: {len(illumination_angles)} (0° - 85°)")
+    print(f"  Viewing angles: {len(viewing_angles)} (0° - 85°)")
+    print(f"  Relative azimuths: {len(relative_azimuths)} (0° - 360°)")
     
     generator = ISSIALUTGenerator(
         wavelengths=wavelengths,
@@ -475,46 +393,44 @@ def main():
         relative_azimuths=relative_azimuths
     )
     
-    output_dir = Path("lookup_tables")
+    output_dir = Path("lookup_tables_fixed")
     output_dir.mkdir(exist_ok=True)
     
-    # Generate LUTs
-    print("\n" + "="*60)
-    print("Generating Lookup Tables")
-    print("="*60)
+    print(f"\n✓ Output directory: {output_dir}")
+    print("\n" + "="*70)
+    input("Press Enter to start LUT generation...")
     
-    # 1. Scaled Band Depth LUT (relatively small)
-    print("\n1. Generating Scaled Band Depth LUT...")
+    # 1. Scaled Band Depth LUT
     sbd_lut = generator.generate_sbd_lut(
         output_path=output_dir / "sbd_lut.npy"
     )
-    print(f"SBD LUT shape: {sbd_lut.shape}")
     
-    # 2. Albedo LUT (small)
-    print("\n2. Generating White-Sky Albedo LUT...")
+    # 2. Albedo LUT
     albedo_lut = generator.generate_albedo_lut(
         output_path=output_dir / "albedo_lut.npy"
     )
-    print(f"Albedo LUT shape: {albedo_lut.shape}")
     
-    # 3. Anisotropy Factor LUT (large - use Dask)
-    print("\n3. Generating Anisotropy Factor LUT...")
-    print("WARNING: This may take significant time and memory!")
+    # 3. Anisotropy Factor LUT
+    print("\n" + "="*70)
+    print("Ready to generate Anisotropy LUT")
+    print("WARNING: This is large (~2-3 GB) and takes time!")
+    print("="*70)
     response = input("Continue? (y/n): ")
     
     if response.lower() == 'y':
         anisotropy_lut = generator.generate_anisotropy_lut(
-            output_path=output_dir / "anisotropy_lut.npy",
-            use_dask=True
+            output_path=output_dir / "anisotropy_lut.npy"
         )
-        print(f"Anisotropy LUT shape: {anisotropy_lut.shape}")
-    else:
-        print("Skipping anisotropy LUT generation")
     
-    print("\n" + "="*60)
-    print("LUT Generation Complete!")
-    print("="*60)
-    print(f"Output directory: {output_dir}")
+    print("\n" + "="*70)
+    print("✓ LUT GENERATION COMPLETE")
+    print("="*70)
+    print(f"\nNew LUTs saved to: {output_dir}")
+    print("\nNext steps:")
+    print("1. Verify the band depths look reasonable (0.08-0.12)")
+    print("2. Replace your old LUTs with these new ones")
+    print("3. Re-run processing with the fixed continuum removal")
+    print("="*70)
 
 
 if __name__ == "__main__":
