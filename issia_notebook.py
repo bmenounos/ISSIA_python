@@ -1,490 +1,154 @@
-"""
-ISSIA Processor - Jupyter Notebook Version with Lazy I/O
-
-This version includes:
-1. Multi-core support (fixed pickling) ✓
-2. Lazy chunked I/O (fast network reading) ✓
-3. Progress tracking for notebooks ✓
-
-Key fix: Using da.from_delayed for proper lazy chunk reading
-"""
-
+# issia_notebook.py - COMPLETE FIXED VERSION
 import numpy as np
 import dask.array as da
-from dask.diagnostics import ProgressBar
-import dask
 import rasterio
-from rasterio.windows import Window
 from pathlib import Path
-from typing import Tuple, Dict, Optional
-import warnings
-import time
-import sys
-
-# Import the FIXED base processor
-from issia_core import ISSIAProcessor
-
+from issia_core import ISSIAProcessor, _lookup_grain_size_block, _lookup_anisotropy_block
 
 class ISSIAProcessorNotebook(ISSIAProcessor):
-    """
-    ISSIA Processor optimized for Jupyter notebooks
-    WITH lazy chunked I/O for fast network reading
-    """
-    
-    def __init__(self, *args, verbose=True, **kwargs):
-        """
-        Initialize with verbosity option
+    def __init__(self, **kwargs):
+        super().__init__(
+            wavelengths=kwargs.get('wavelengths', np.zeros(1)),
+            grain_radii=kwargs.get('grain_radii', np.zeros(1)),
+            illumination_angles=kwargs.get('illumination_angles', np.zeros(1)),
+            viewing_angles=kwargs.get('viewing_angles', np.zeros(1)),
+            relative_azimuths=kwargs.get('relative_azimuths', np.zeros(1))
+        )
+        self.verbose = True
+        self.chunk_size = kwargs.get('chunk_size', (256, 256))
+
+    def load_lookup_tables(self, sbd_path, aniso_path, alb_path):
+        super().load_lookup_tables(sbd_path, aniso_path, alb_path)
         
-        Parameters:
-        -----------
-        verbose : bool
-            Print detailed progress information
-        """
-        super().__init__(*args, **kwargs)
-        self.verbose = verbose
-        
-    def _print(self, message, level='INFO'):
-        """Print message if verbose"""
-        if self.verbose:
-            timestamp = time.strftime('%H:%M:%S')
-            print(f"[{timestamp}] {level}: {message}")
-            sys.stdout.flush()
-    
-    def _read_envi_file(self, filepath: Path, window=None) -> da.Array:
-        """
-        Read ENVI file with WORKING lazy chunked I/O
-        
-        Key difference: For subsets, reads directly. For full files, creates
-        lazy Dask array using da.from_delayed that reads chunks on-demand.
-        """
-        filepath = Path(filepath)
-        if filepath.suffix.lower() == '.hdr':
-            filepath = filepath.with_suffix('.dat')
-        
-        # Read scale factor from header
-        hdr_file = str(filepath).replace('.dat', '.hdr')
-        scale_factor = 1.0
-        try:
-            with open(hdr_file, 'r') as f:
-                for line in f:
-                    if 'reflectance scale factor' in line.lower():
-                        scale_factor = float(line.split('=')[1].strip())
-                        break
-        except (FileNotFoundError, OSError):
-            pass
-        
-        if window is not None:
-            # SUBSET: Read immediately (small enough)
-            with rasterio.open(str(filepath)) as src:
-                data = src.read(window=window)
-                data = data.astype(float) / scale_factor
-                data = np.where(data == 0, np.nan, data)
-                dask_data = da.from_array(data, chunks=(data.shape[0], 
-                                                         self.chunk_size[0], 
-                                                         self.chunk_size[1]))
-            return dask_data
-        
-        else:
-            # FULL FILE: Use lazy reading with da.from_delayed
-            # This is the KEY optimization - only reads metadata, not data!
-            with rasterio.open(str(filepath)) as src:
-                n_bands = src.count
-                n_rows = src.height
-                n_cols = src.width
-            
-            shape = (n_bands, n_rows, n_cols)
-            chunks = (n_bands, self.chunk_size[0], self.chunk_size[1])
-            
-            # Create delayed functions for each chunk
-            @dask.delayed
-            def read_chunk(filepath, row_start, row_end, col_start, col_end, scale_factor):
-                """Read a single chunk from file"""
-                with rasterio.open(str(filepath)) as src:
-                    win = Window(col_start, row_start, 
-                               col_end - col_start, 
-                               row_end - row_start)
-                    data = src.read(window=win)
-                
-                # Apply scale and mask
-                data = data.astype(float) / scale_factor
-                data = np.where(data == 0, np.nan, data)
-                return data
-            
-            # Build array of delayed chunks
-            delayed_chunks = []
-            for row_start in range(0, n_rows, self.chunk_size[0]):
-                row_end = min(row_start + self.chunk_size[0], n_rows)
-                row_chunks = []
-                
-                for col_start in range(0, n_cols, self.chunk_size[1]):
-                    col_end = min(col_start + self.chunk_size[1], n_cols)
-                    
-                    # Create delayed chunk
-                    chunk = read_chunk(filepath, row_start, row_end, 
-                                     col_start, col_end, scale_factor)
-                    
-                    # Convert to dask array
-                    chunk_shape = (n_bands, row_end - row_start, col_end - col_start)
-                    chunk_array = da.from_delayed(chunk, shape=chunk_shape, dtype=float)
-                    row_chunks.append(chunk_array)
-                
-                delayed_chunks.append(row_chunks)
-            
-            # Concatenate all chunks
-            rows = [da.concatenate(row_chunks, axis=2) for row_chunks in delayed_chunks]
-            dask_data = da.concatenate(rows, axis=1)
-            
-            return dask_data
-    
-    def _read_single_band(self, filepath: Path, window=None) -> da.Array:
-        """
-        Read single band with lazy I/O
-        """
-        filepath = Path(filepath)
-        if filepath.suffix.lower() == '.hdr':
-            filepath = filepath.with_suffix('.dat')
-        
-        if window is not None:
-            # Subset - read immediately
-            with rasterio.open(str(filepath)) as src:
-                data = src.read(1, window=window)
-                dask_data = da.from_array(data, chunks=self.chunk_size)
-            return dask_data
-        
-        else:
-            # Full file - lazy reading
-            with rasterio.open(str(filepath)) as src:
-                n_rows = src.height
-                n_cols = src.width
-            
-            shape = (n_rows, n_cols)
-            
-            @dask.delayed
-            def read_chunk(filepath, row_start, row_end, col_start, col_end):
-                """Read chunk on-demand"""
-                with rasterio.open(str(filepath)) as src:
-                    win = Window(col_start, row_start,
-                               col_end - col_start,
-                               row_end - row_start)
-                    data = src.read(1, window=win)
-                return data.astype(float)
-            
-            # Build array of delayed chunks
-            delayed_chunks = []
-            for row_start in range(0, n_rows, self.chunk_size[0]):
-                row_end = min(row_start + self.chunk_size[0], n_rows)
-                row_chunks = []
-                
-                for col_start in range(0, n_cols, self.chunk_size[1]):
-                    col_end = min(col_start + self.chunk_size[1], n_cols)
-                    
-                    chunk = read_chunk(filepath, row_start, row_end, col_start, col_end)
-                    chunk_shape = (row_end - row_start, col_end - col_start)
-                    chunk_array = da.from_delayed(chunk, shape=chunk_shape, dtype=float)
-                    row_chunks.append(chunk_array)
-                
-                delayed_chunks.append(row_chunks)
-            
-            # Concatenate
-            rows = [da.concatenate(row_chunks, axis=1) for row_chunks in delayed_chunks]
-            dask_data = da.concatenate(rows, axis=0)
-            
-            return dask_data
-    
-    def read_atcor_files(self, data_dir: Path, flight_line: str, subset: tuple = None) -> Dict:
-        """
-        Read ATCOR-4 output files with progress tracking
-        NOW WITH WORKING LAZY I/O!
-        """
-        self._print(f"Reading ATCOR files for flight line: {flight_line}")
-        start_time = time.time()
-        
-        # Check files
-        self._print("Checking for required files...")
-        required_files = {
-            'inn': f"{flight_line}.inn",
-            'atm': f"{flight_line}_atm.dat",
-            'eglo': f"{flight_line}_eglo.dat",
-            'slp': f"{flight_line}_slp.dat",
-            'asp': f"{flight_line}_asp.dat"
-        }
-        
-        missing_files = []
-        for key, filename in required_files.items():
-            filepath = data_dir / filename
-            if not filepath.exists():
-                missing_files.append(filename)
-            else:
-                size_mb = filepath.stat().st_size / (1024**2)
-                self._print(f"  ✓ Found {filename} ({size_mb:.1f} MB)")
-        
-        if missing_files:
-            raise FileNotFoundError(f"Missing required files: {missing_files}")
-        
-        # Setup window
+        # Only set grain_radii_albedo for albedo LUT lookups
+        if hasattr(self, 'albedo_lut') and hasattr(self, 'grain_radii'):
+            self.grain_radii_albedo = self.grain_radii
+
+    def load_flight_line_data(self, base_dir, flight_line, subset=None):
+        data_dir = Path(base_dir)
         window = None
         if subset:
-            r0, r1, c0, c1 = subset
-            window = Window(c0, r0, c1 - c0, r1 - r0)
-            print(f"\nReading subset window: rows {r0}-{r1}, cols {c0}-{c1}")
-            print("(Will read immediately - small data)\n")
-        else:
-            print(f"\n⚡ LAZY I/O MODE: Creating delayed readers")
-            print("(Chunks will be read on-demand during processing)\n")
+            ymin, ymax, xmin, xmax = subset
+            window = rasterio.windows.Window(xmin, ymin, xmax - xmin, ymax - ymin)
+
+        refl = self._read_envi_file(data_dir / f"{flight_line}_atm.dat", window=window)
+        flux = self._read_envi_file(data_dir / f"{flight_line}_eglo.dat", window=window)
+        slope = self._read_single_band(data_dir / f"{flight_line}_slp.dat", window=window)
+        aspect = self._read_single_band(data_dir / f"{flight_line}_asp.dat", window=window)
+        zenith, azimuth = self._read_solar_zenith(data_dir / f"{flight_line}.inn")
         
-        print(f"Loading {len(required_files)} files...")
+        illum = self.calculate_local_illumination_angle(zenith, azimuth, slope, aspect)
         
-        results = {}
+        def _calc_bd_block(refl_block, wvl):
+            out = np.zeros((refl_block.shape[1], refl_block.shape[2]))
+            for i in range(refl_block.shape[1]):
+                for j in range(refl_block.shape[2]):
+                    res = self.continuum_removal(refl_block[:, i, j], wvl)
+                    out[i, j] = res[1] if isinstance(res, tuple) else res
+            return out
+
+        bd_map = da.map_blocks(
+            _calc_bd_block, refl, wvl=self.wavelengths,
+            dtype=float, drop_axis=0, chunks=refl.chunks[1:]
+        )
+
+        return {
+            'refl_hdrf': refl,
+            'global_flux': flux, 
+            'illumination': illum, 
+            'bd_830_1130': bd_map,
+        }
+
+    def read_atcor_files(self, data_dir, flight_line, subset=None):
+        """
+        Override base class method to add subset parameter support.
+        Returns dictionary with keys expected by run_issia_claude.py.
+        """
+        data_dir = Path(data_dir)
+        window = None
+        if subset:
+            ymin, ymax, xmin, xmax = subset
+            window = rasterio.windows.Window(xmin, ymin, xmax - xmin, ymax - ymin)
+
+        # Read data files
+        reflectance = self._read_envi_file(data_dir / f"{flight_line}_atm.dat", window=window)
+        global_flux = self._read_envi_file(data_dir / f"{flight_line}_eglo.dat", window=window)
+        slope = self._read_single_band(data_dir / f"{flight_line}_slp.dat", window=window)
+        aspect = self._read_single_band(data_dir / f"{flight_line}_asp.dat", window=window)
+        solar_zenith, solar_azimuth = self._read_solar_zenith(data_dir / f"{flight_line}.inn")
         
-        # Load files with timing
-        file_start = time.time()
-        print(f"  [1/5] Loading Reflectance...", end='', flush=True)
-        atm_file = data_dir / f"{flight_line}_atm.dat"
-        results['reflectance'] = self._read_envi_file(atm_file, window=window)
-        print(f" ✓ ({time.time() - file_start:.1f}s)")
-        
-        file_start = time.time()
-        print(f"  [2/5] Loading Global Flux...", end='', flush=True)
-        eglo_file = data_dir / f"{flight_line}_eglo.dat"
-        results['global_flux'] = self._read_envi_file(eglo_file, window=window)
-        print(f" ✓ ({time.time() - file_start:.1f}s)")
-        
-        file_start = time.time()
-        print(f"  [3/5] Loading Slope...", end='', flush=True)
-        slp_file = data_dir / f"{flight_line}_slp.dat"
-        results['slope'] = self._read_single_band(slp_file, window=window)
-        print(f" ✓ ({time.time() - file_start:.1f}s)")
-        
-        file_start = time.time()
-        print(f"  [4/5] Loading Aspect...", end='', flush=True)
-        asp_file = data_dir / f"{flight_line}_asp.dat"
-        results['aspect'] = self._read_single_band(asp_file, window=window)
-        print(f" ✓ ({time.time() - file_start:.1f}s)")
-        
-        file_start = time.time()
-        print(f"  [5/5] Loading Solar Angles...", end='', flush=True)
-        inn_file = data_dir / f"{flight_line}.inn"
-        solar_zenith, solar_azimuth = self._read_solar_zenith(inn_file)
-        results['solar_zenith'] = solar_zenith
-        results['solar_azimuth'] = solar_azimuth
-        print(f" ✓ ({time.time() - file_start:.1f}s)")
-        
-        # Get geotransform
-        with rasterio.open(str(atm_file)) as src:
-            transform = src.transform
+        # Get transform and CRS from reflectance file
+        with rasterio.open(data_dir / f"{flight_line}_atm.dat") as src:
+            if window:
+                transform = src.window_transform(window)
+            else:
+                transform = src.transform
             crs = src.crs
-            
-            if subset:
-                r0, r1, c0, c1 = subset
-                from rasterio.transform import Affine
-                transform = transform * Affine.translation(c0, r0)
-        
-        total_time = time.time() - start_time
-        print(f"\n✓ All files loaded in {total_time:.1f}s")
-        
-        if not subset and total_time < 2:
-            print(f"⚡ FAST! Lazy I/O working - data will be read during compute")
         
         return {
-            'reflectance': results['reflectance'],
-            'global_flux': results['global_flux'],
-            'slope': results['slope'],
-            'aspect': results['aspect'],
-            'solar_zenith': results['solar_zenith'],
-            'solar_azimuth': results['solar_azimuth'],
+            'reflectance': reflectance,
+            'global_flux': global_flux,
+            'solar_zenith': solar_zenith,
+            'solar_azimuth': solar_azimuth,
+            'slope': slope,
+            'aspect': aspect,
             'transform': transform,
             'crs': crs
         }
-    
-    def process_flight_line(self,
-                          data_dir: Path,
-                          flight_line: str,
-                          output_dir: Path,
-                          viewing_angle: float = 0.0,
-                          solar_azimuth: float = None,
-                          subset: tuple = None) -> Dict[str, Path]:
-        """
-        Process a single flight line with detailed progress tracking
-        """
-        overall_start = time.time()
-        
-        print("\n" + "="*70)
-        print(f"PROCESSING FLIGHT LINE: {flight_line}")
-        if subset:
-            print(f"SUBSET MODE: rows {subset[0]}-{subset[1]}, cols {subset[2]}-{subset[3]}")
-        else:
-            print(f"FULL IMAGE MODE with lazy I/O")
-        print("="*70 + "\n")
-        
-        # Read input files
-        data = self.read_atcor_files(data_dir, flight_line, subset=subset)
-        
-        # Extract arrays and metadata
-        reflectance = data['reflectance']
-        global_flux = data['global_flux']
-        slope = data['slope']
-        aspect = data['aspect']
-        solar_zenith = data['solar_zenith']
-        transform = data['transform']
-        crs = data['crs']
-        
-        # Use solar azimuth from file if not provided
-        if solar_azimuth is None:
-            solar_azimuth = data['solar_azimuth']
-            self._print(f"Using solar azimuth from .inn file: {solar_azimuth:.2f}°")
-        
-        n_bands, n_rows, n_cols = reflectance.shape
-        n_pixels = n_rows * n_cols
-        
-        print(f"\nDATA SUMMARY:")
-        print(f"  Dimensions: {n_rows} rows × {n_cols} cols × {n_bands} bands")
-        print(f"  Total pixels: {n_pixels:,}")
-        print(f"  Chunk size: {self.chunk_size}")
-        print(f"  Solar zenith: {solar_zenith:.2f}°")
-        print(f"  Solar azimuth: {solar_azimuth:.2f}°")
-        print()
-        
-        # Processing steps
-        step_start = time.time()
-        self._print("Step 1/6: Calculating local illumination angles...")
-        local_illum = self.calculate_local_illumination_angle(
-            solar_zenith, solar_azimuth, slope, aspect
-        )
-        self._print(f"  ✓ Completed in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # NDSI mask
-        step_start = time.time()
-        self._print("Applying NDSI snow/ice mask...")
-        snow_mask = self.calculate_ndsi(reflectance)
-        snow_fraction = (snow_mask.sum() / snow_mask.size).compute()
-        self._print(f"  Snow/ice fraction: {100*snow_fraction:.1f}%")
-        reflectance = da.where(snow_mask, reflectance, np.nan)
-        self._print(f"  ✓ NDSI masking completed in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Band depths
-        step_start = time.time()
-        self._print("Step 2/6: Calculating scaled band depths...")
-        self._print("  (Extracting 1030 nm ice absorption feature)")
-        band_depths = da.map_blocks(
-            lambda spec_block: np.array([
-                [self.continuum_removal(spec_block[:, i, j], self.wavelengths)[1]
-                 for j in range(spec_block.shape[2])]
-                for i in range(spec_block.shape[1])
-            ]),
-            reflectance,
-            dtype=float,
-            drop_axis=0,
-            chunks=(self.chunk_size[0], self.chunk_size[1])
-        )
-        self._print(f"  ✓ Band depth array created in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Grain size
-        step_start = time.time()
-        self._print("Step 3/6: Retrieving grain sizes from lookup tables...")
-        grain_size = self.retrieve_grain_size(band_depths, local_illum, viewing_angle, 0.0)
-        self._print(f"  ✓ Grain size retrieval configured in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Anisotropy
-        step_start = time.time()
-        self._print("Step 4/6: Calculating anisotropy factors...")
-        self._print("  (Converting HCRF to HDRF)")
-        anisotropy = self.calculate_anisotropy_factor(grain_size, local_illum, viewing_angle, 0.0)
-        reflectance_hdrf = reflectance * anisotropy
-        self._print(f"  ✓ Anisotropy calculation configured in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Spectral albedo
-        step_start = time.time()
-        self._print("Step 5/6: Calculating spectral albedo...")
-        spectral_albedo = self.calculate_spectral_albedo(grain_size, reflectance_hdrf, anisotropy)
-        
-        self._print("  Calculating broadband albedo...")
-        mean_flux = da.nanmean(global_flux, axis=(1, 2)).compute()
-        broadband_albedo = self.calculate_broadband_albedo(spectral_albedo, mean_flux)
-        self._print(f"  ✓ Spectral albedo configured in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Radiative forcing
-        step_start = time.time()
-        self._print("Step 6/6: Calculating radiative forcing...")
-        clean_albedo = self.calculate_spectral_albedo(
-            grain_size, reflectance_hdrf * 0 + anisotropy, anisotropy
-        )
-        rf_lap = self.calculate_radiative_forcing(clean_albedo, spectral_albedo, mean_flux)
-        self._print(f"  ✓ Radiative forcing configured in {time.time() - step_start:.1f}s", level='SUCCESS')
-        
-        # Compute results
-        print("\n" + "="*70)
-        print("COMPUTING RESULTS")
-        if not subset:
-            print("(Now reading chunks from network as needed...)")
-        print("="*70 + "\n")
-        
-        compute_tasks = [
-            ('grain size', grain_size),
-            ('broadband albedo', broadband_albedo),
-            ('radiative forcing', rf_lap)
-        ]
-        
-        results_computed = {}
-        
-        for i, (name, data) in enumerate(compute_tasks, 1):
-            self._print(f"[{i}/3] Computing {name}...")
-            compute_start = time.time()
-            with ProgressBar():
-                result = data.compute()
-            compute_time = time.time() - compute_start
-            self._print(f"  ✓ {name.title()} computed in {compute_time:.1f}s")
-            results_computed[name.replace(' ', '_')] = result
-        
-        grain_size_result = results_computed['grain_size']
-        broadband_albedo_result = results_computed['broadband_albedo']
-        rf_lap_result = results_computed['radiative_forcing']
-        
-        print("="*70 + "\n")
-        
-        # Statistics
-        print("\nRETRIEVAL STATISTICS:")
-        print(f"  Grain Size: {np.nanmean(grain_size_result):.1f} ± {np.nanstd(grain_size_result):.1f} μm")
-        print(f"              Range: {np.nanmin(grain_size_result):.1f} - {np.nanmax(grain_size_result):.1f} μm")
-        print(f"  Broadband Albedo: {np.nanmean(broadband_albedo_result):.3f} ± {np.nanstd(broadband_albedo_result):.3f}")
-        print(f"                    Range: {np.nanmin(broadband_albedo_result):.3f} - {np.nanmax(broadband_albedo_result):.3f}")
-        print(f"  Radiative Forcing: {np.nanmean(rf_lap_result):.1f} ± {np.nanstd(rf_lap_result):.1f} W/m²")
-        print(f"                     Range: {np.nanmin(rf_lap_result):.1f} - {np.nanmax(rf_lap_result):.1f} W/m²")
-        print()
-        
-        # Save outputs
-        print("SAVING OUTPUTS...")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        output_files = {}
-        
-        grain_size_file = output_dir / f"{flight_line}_grain_size.tif"
-        self._save_geotiff(grain_size_result, grain_size_file, transform, crs)
-        output_files['grain_size'] = grain_size_file
-        
-        albedo_file = output_dir / f"{flight_line}_broadband_albedo.tif"
-        self._save_geotiff(broadband_albedo_result, albedo_file, transform, crs)
-        output_files['broadband_albedo'] = albedo_file
-        
-        rf_file = output_dir / f"{flight_line}_radiative_forcing.tif"
-        self._save_geotiff(rf_lap_result, rf_file, transform, crs)
-        output_files['radiative_forcing'] = rf_file
-        
-        total_time = time.time() - overall_start
-        
-        print("\n" + "="*70)
-        print(f"✓ PROCESSING COMPLETE in {total_time/60:.1f} minutes")
-        print("="*70)
-        print(f"\nOutputs saved to: {output_dir}")
-        for key, filepath in output_files.items():
-            print(f"  • {key}: {filepath.name}")
-        print()
-        
-        return output_files
 
+    def calculate_radiative_forcing(self, grain_size, spectral_albedo_actual, global_flux):
+        """
+        Calculate radiative forcing - EXACT MATLAB implementation.
+        
+        MATLAB:
+        image.rf(i,j) = 0.1*(trapz(wvl_specim_um(1:right_idx), 
+                             rf_diff .* squeeze(sflux(i,j,1:right_idx))));
+        
+        Algorithm:
+        1. Filter to wavelengths <= 1000 nm
+        2. Convert wavelengths to micrometers (wvl / 1000)
+        3. For each pixel: look up clean albedo from LUT using grain size
+        4. Calculate diff = max(clean_albedo - actual_albedo, 0)
+        5. Integrate: 0.1 * trapz(wavelength_um, diff * flux_pixel)
+        """
+        # Filter to wavelengths <= 1000 nm
+        rf_mask = self.wavelengths <= 1000
+        wvl_nm = self.wavelengths[rf_mask]  # Keep in nanometers
+        actual_sub = spectral_albedo_actual[rf_mask, :, :]
+        flux_sub = global_flux[rf_mask, :, :]
 
-if __name__ == "__main__":
-    print("ISSIA Notebook Processor with Lazy I/O")
-    print("✓ Multi-core support")
-    print("✓ Lazy chunked I/O using da.from_delayed")
-    print("✓ Progress tracking")
-    print("\nReady for fast network processing!")
+        def _rf_block(spec_block, flux_block, gs_2d, wvl_local, lut, radii, mask):
+            """Process one chunk - matches MATLAB pixel-by-pixel logic."""
+            rows, cols = spec_block.shape[1], spec_block.shape[2]
+            result = np.zeros((rows, cols), dtype=np.float32)
+            
+            for i in range(rows):
+                for j in range(cols):
+                    gs = gs_2d[i, j]
+                    if np.isnan(gs) or gs <= 0:
+                        result[i, j] = np.nan
+                        continue
+                    
+                    # Look up clean albedo for this grain size
+                    gs_idx = np.argmin(np.abs(radii - gs))
+                    albedo_clean = lut[gs_idx, mask]
+                    
+                    # Calculate albedo difference (clean - actual), clip to >= 0
+                    rf_diff = np.maximum(albedo_clean - spec_block[:, i, j], 0)
+                    
+                    # Integration with wavelengths in nm
+                    result[i, j] = np.trapz(rf_diff * flux_block[:, i, j], wvl_local)
+            
+            return result
+
+        return da.map_blocks(
+            _rf_block, actual_sub, flux_sub,
+            gs_2d=grain_size.compute(),
+            wvl_local=wvl_nm, 
+            lut=self.albedo_lut, 
+            radii=self.grain_radii_albedo,
+            mask=rf_mask,
+            dtype=np.float32, 
+            drop_axis=0, 
+            chunks=actual_sub.chunks[1:]
+        )
