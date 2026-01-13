@@ -1,3 +1,4 @@
+
 """
 ISSIA Processor - Optimized for parallel processing
 
@@ -188,8 +189,9 @@ if HAS_NUMBA:
                         diff_w = max(0.0, clean_w - spec_block[w, i, j])
                         diff_w1 = max(0.0, clean_w1 - spec_block[w + 1, i, j])
                         
-                        flux_w = flux_block[w, i, j]
-                        flux_w1 = flux_block[w + 1, i, j]
+                        ## convert nm to micron
+                        flux_w = flux_block[w, i, j] * 1000 
+                        flux_w1 = flux_block[w + 1, i, j] * 1000
                         
                         # Trapezoidal integration
                         integral += 0.5 * (diff_w * flux_w + diff_w1 * flux_w1) * (wvl_um[w + 1] - wvl_um[w])
@@ -471,7 +473,8 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
                     gs_idx = np.argmin(np.abs(self._grain_radii_f32 - gs[i, j]))
                     albedo_clean = self.albedo_lut[gs_idx, rf_mask]
                     rf_diff = np.maximum(albedo_clean - spec[rf_mask, i, j], 0)
-                    result[i, j] = np.trapz(rf_diff * flux[rf_mask, i, j], wvl_um[rf_mask])
+                    ## convert flux from nm to micron
+                    result[i, j] = np.trapz(rf_diff * (flux[rf_mask, i, j] * 1000.0), wvl_um[rf_mask])
         
         return da.from_array(result, chunks=self.chunk_size)
 
