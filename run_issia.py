@@ -172,26 +172,61 @@ def continuum_removal_830_1130(spectrum, wavelengths):
         return np.nan
 
 
+# Shared memory globals for band depth workers
+_shm = None
+_spec = None
+_out_shm = None
+_output = None
+_wvl = None
+
+def _init_bd_worker(shm_name, out_name, shape, wvl):
+    global _shm, _spec, _out_shm, _output, _wvl
+    from multiprocessing import shared_memory
+    _shm = shared_memory.SharedMemory(name=shm_name)
+    _spec = np.ndarray(shape, dtype=np.float32, buffer=_shm.buf)
+    _out_shm = shared_memory.SharedMemory(name=out_name)
+    _output = np.ndarray((shape[1], shape[2]), dtype=np.float32, buffer=_out_shm.buf)
+    _wvl = wvl
+
+def _process_bd_row(i):
+    for j in range(_spec.shape[2]):
+        spectrum = np.nan_to_num(_spec[:, i, j], nan=0.0)
+        smoothed = savgol_filter(spectrum, 11, 3, mode='nearest')
+        _output[i, j] = continuum_removal_830_1130(smoothed, _wvl)
+    return i
+
 def parallel_band_depth(spec_block, wavelengths):
-    """Calculate band depth for a block - uses Numba if available"""
-    if HAS_NUMBA:
-        left_idx = np.argmin(np.abs(wavelengths - 900.0))
-        right_idx = np.argmin(np.abs(wavelengths - 1130.0))
-        return _parallel_band_depth_numba(
-            spec_block.astype(np.float32), 
-            wavelengths.astype(np.float32),
-            left_idx, right_idx
-        )
-    else:
-        # Fallback to scipy-based method
-        rows, cols = spec_block.shape[1], spec_block.shape[2]
-        result = np.zeros((rows, cols), dtype=np.float32)
-        for i in range(rows):
-            for j in range(cols):
-                spectrum = np.nan_to_num(spec_block[:, i, j], nan=0.0)
-                smoothed = savgol_filter(spectrum, 11, 3, mode='nearest')
-                result[i, j] = continuum_removal_830_1130(smoothed, wavelengths)
-        return result
+    """Calculate band depth using shared memory multiprocessing"""
+    from multiprocessing import Pool, shared_memory
+    
+    spec_block = spec_block.astype(np.float32)
+    rows, cols = spec_block.shape[1], spec_block.shape[2]
+    n_workers = os.cpu_count()
+    print(f"    Using {n_workers} processes with shared memory...")
+    
+    # Create shared memory for input
+    shm = shared_memory.SharedMemory(create=True, size=spec_block.nbytes)
+    shared_arr = np.ndarray(spec_block.shape, dtype=spec_block.dtype, buffer=shm.buf)
+    shared_arr[:] = spec_block[:]
+    
+    # Create shared memory for output
+    out_shm = shared_memory.SharedMemory(create=True, size=rows * cols * 4)
+    output = np.ndarray((rows, cols), dtype=np.float32, buffer=out_shm.buf)
+    output[:] = np.nan
+    
+    try:
+        with Pool(n_workers, initializer=_init_bd_worker, 
+                  initargs=(shm.name, out_shm.name, spec_block.shape, wavelengths)) as pool:
+            list(pool.imap_unordered(_process_bd_row, range(rows)))
+        
+        result = output.copy()
+    finally:
+        shm.close()
+        shm.unlink()
+        out_shm.close()
+        out_shm.unlink()
+    
+    return result
 
 
 def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
