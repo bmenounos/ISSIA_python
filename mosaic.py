@@ -106,7 +106,9 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
             tqdm.write(f"  Warning: cannot open {f}, skipping")
             continue
         band = src.GetRasterBand(1).ReadAsArray().astype(np.float32)
-        band[band == src.GetRasterBand(1).GetNoDataValue() or 0] = np.nan
+        nodata = src.GetRasterBand(1).GetNoDataValue()
+        if nodata is not None:
+            band[band == nodata] = np.nan
         w = _build_weight(band, edge_setback)
         w_ds = _to_mem_ds(w, src)
         prepared.append((src, w_ds))
