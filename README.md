@@ -7,7 +7,7 @@ Python implementation of the ISSIA algorithm for retrieving snow and ice surface
 ISSIA retrieves three primary products from ATCOR-processed hyperspectral data:
 
 1. **Snow Grain Size** (μm) - Optical effective grain radius
-2. **Broadband Albedo** - Hemispherical reflectance integrated across solar spectrum  
+2. **Broadband Albedo** - Hemispherical reflectance integrated across solar spectrum
 3. **Radiative Forcing** (W/m²) - Absorption enhancement by light-absorbing particles
 
 ## Installation
@@ -19,6 +19,7 @@ numpy>=1.20
 scipy>=1.7
 dask>=2022.0
 rasterio>=1.3
+gdal>=3.0
 tqdm>=4.60
 numba>=0.56  # HIGHLY RECOMMENDED for 5-10x speedup
 ```
@@ -28,7 +29,7 @@ Install dependencies:
 pip install numpy scipy dask rasterio tqdm numba
 ```
 
-**Important:** Without Numba, processing will use pure Python loops and be 5-10x slower.
+**Important:** Without Numba, processing will use shared-memory multiprocessing and be 5-10x slower.
 
 ## Quick Start
 
@@ -40,10 +41,10 @@ Before processing flight lines, generate the lookup tables:
 python generate_luts.py --wvl wvl.npy --iop IOP_2008_ASCIItable.txt --output-dir luts
 ```
 
-This takes 30-60 minutes and creates:
-- `sbd_lut.npy` - Scaled band depth lookup table
-- `albedo_lut.npy` - Clean snow albedo lookup table  
-- `anisotropy_lut.npz` - BRDF anisotropy correction factors
+This takes 30–60 minutes and creates:
+- `sbd_lut.npy` — Scaled band depth lookup table
+- `albedo_lut.npy` — Clean snow albedo lookup table
+- `anisotropy_lut.npz` — BRDF anisotropy correction factors
 
 ### 2. Process Single Flight Line
 
@@ -55,23 +56,31 @@ python run_issia.py \
     --lut-dir luts
 ```
 
-### 3. Batch Process Multiple Flight Lines
+### 3. Batch Process an Acquisition
 
-Process all flight lines in a directory:
+Process all flight lines in a directory, then mosaic the results:
+
 ```bash
 python run_issia_batch.py \
-    --data-dir /path/to/atcor/data \
+    --data-dir /path/to/atcor/clipped \
     --output-dir /path/to/output \
-    --lut-dir luts \
-    --continue-on-error
+    --lut-dir /path/to/luts \
+    --continue-on-error \
+    --mosaic
 ```
 
-Process specific flight lines:
+Flight lines whose three output files (`_gs.tif`, `_albedo.tif`, `_rf.tif`) already exist are **skipped automatically**, so re-running the command only processes new or failed lines and then rebuilds the mosaic.
+
+### 4. Mosaic Only
+
+If flight lines are already processed and you only need the mosaic:
+
 ```bash
-python run_issia_batch.py \
-    --data-dir /path/to/atcor/data \
-    --output-dir /path/to/output \
-    --flight-lines flight1 flight2 flight3
+# All three products from a batch output directory:
+python mosaic.py --batch-dir /path/to/output --mosaic-dir /path/to/mosaics
+
+# Single product from a wildcard:
+python mosaic.py -i "output/*_albedo.tif" -o mosaic_albedo.tif
 ```
 
 ## Input Data Requirements
@@ -91,15 +100,36 @@ ISSIA expects ATCOR-4 output files for each flight line:
 | File | Description | Units |
 |------|-------------|-------|
 | `{flight_line}_gs.tif` | Snow grain size | μm |
-| `{flight_line}_albedo.tif` | Broadband albedo | 0-1 |
+| `{flight_line}_albedo.tif` | Broadband albedo | 0–1 |
 | `{flight_line}_rf.tif` | Radiative forcing | W/m² |
+
+Mosaic outputs (when `--mosaic` is used):
+
+| File | Description |
+|------|-------------|
+| `mosaics/mosaic_gs.tif` | Seamless grain size mosaic |
+| `mosaics/mosaic_albedo.tif` | Seamless albedo mosaic |
+| `mosaics/mosaic_rf.tif` | Seamless radiative forcing mosaic |
 
 ### Optional Diagnostics
 
 Use `--diagnostics` flag to also save:
-- `_slope.tif`, `_aspect.tif` - Terrain parameters
-- `_theta_i_eff.tif`, `_theta_v_eff.tif`, `_raa_eff.tif` - Effective viewing angles
-- `_band_depth.tif` - 1030nm absorption band depth
+- `_slope.tif`, `_aspect.tif` — Terrain parameters
+- `_theta_i_eff.tif`, `_theta_v_eff.tif` — Effective viewing angles
+- `_band_depth.tif` — 1030 nm absorption band depth
+
+## Seamless Mosaicking
+
+`mosaic.py` uses **distance-transform edge weighting** to blend overlapping flight lines without seams:
+
+- Each pixel's weight = its distance to the nearest nodata edge, minus `--edge-setback` pixels
+- In overlap zones the weighted average naturally de-emphasises swath edges, where ATCOR correction is least accurate
+- If a valid region is narrower than the setback (e.g., a thin snow patch), the setback is automatically ignored so no data is lost
+- Processing is tile-based (default 2048 px) to handle large mosaics without loading everything into memory
+
+```bash
+python mosaic.py --batch-dir output/ --mosaic-dir mosaics/ --edge-setback 50
+```
 
 ## Processing Parameters
 
@@ -108,40 +138,52 @@ Use `--diagnostics` flag to also save:
 Pixels are processed if they meet all criteria:
 - NDSI ≥ 0.87 (snow/ice)
 - Local illumination angle ≤ 85°
-- Not in shadow (first band / 560nm band ≤ 1.0)
+- Not in shadow (first band / 560 nm band ≤ 1.0)
 
 ### LUT Dimensions
 
 | Parameter | Range | Step | Values |
 |-----------|-------|------|--------|
-| Grain radius | 30-10000 μm | 30 | 333 |
-| Illumination angle | 0-85° | 5 | 18 |
-| Viewing angle | 0-85° | 5 | 18 |
-| Relative azimuth | 0-360° | 10 | 37 |
+| Grain radius | 30–5000 μm | 30 | 167 |
+| Illumination angle | 0–85° | 5 | 18 |
+| Viewing angle | 0–85° | 5 | 18 |
+| Relative azimuth | 0–360° | 10 | 37 |
 
 ## Package Structure
 
 ```
-issia_package/
-├── issia_core.py          # Base processor class
-├── issia_processor.py     # Extended processor with pixel-wise methods
-├── run_issia.py           # Single flight line processing
-├── run_issia_batch.py     # Batch processing
-├── generate_luts.py       # Lookup table generator
-├── wvl.npy               # Wavelength array
-├── IOP_2008_ASCIItable.txt # Ice optical properties
-└── README.md
+ISSIA_python/
+├── issia_core.py            # Base processor class
+├── issia_processor.py       # Extended processor (Numba pixel-wise methods,
+│                            #   chunked albedo+RF computation)
+├── run_issia.py             # Single flight line processing with tqdm bars
+├── run_issia_batch.py       # Batch processing (skip existing, --mosaic flag)
+├── mosaic.py                # Seamless distance-weighted mosaic
+├── generate_luts.py         # Lookup table generator
+├── generate_snicar_luts.py  # SNICAR-based LUT generator
+├── compare_optical_properties.py  # Validation against MATLAB outputs
+├── wvl.npy                  # Wavelength array (nm)
+└── IOP_2008_ASCIItable.txt  # Ice optical properties
 ```
 
-## Algorithm Reference
+## Command Line Reference
 
-The algorithm is based on:
+### run_issia_batch.py
 
-- **ART Model**: Kokhanovsky & Zege (2004) "Scattering optics of snow"
-- **Terrain Correction**: Dumont et al. (2011) local viewing geometry
-- **Radiative Forcing**: Painter et al. (2013) integration method
-
-## Command Line Options
+```
+--data-dir          Directory containing ATCOR files (required)
+--output-dir        Output directory (required)
+--lut-dir           LUT directory (default: luts)
+--wvl-path          Wavelength file (default: wvl.npy)
+--flight-lines      Specific flight lines to process
+--flight-list       Text file with flight line IDs (one per line)
+--diagnostics       Save diagnostic outputs
+--continue-on-error Continue if a flight line fails
+--workers           Number of worker threads
+--mosaic            Mosaic all products after processing
+--mosaic-dir        Output directory for mosaics (default: <output-dir>/mosaics)
+--edge-setback      Pixels to suppress at each swath edge in mosaic (default: 50)
+```
 
 ### run_issia.py
 
@@ -153,52 +195,46 @@ The algorithm is based on:
 --wvl-path      Wavelength file (default: wvl.npy)
 --subset        Spatial subset as "ymin,ymax,xmin,xmax"
 --diagnostics   Save diagnostic outputs
+--workers       Number of worker threads
 ```
 
-### run_issia_batch.py
+### mosaic.py
 
 ```
---data-dir          Directory containing ATCOR files (required)
---output-dir        Output directory (required)
---lut-dir           LUT directory (default: luts)
---wvl-path          Wavelength file (default: wvl.npy)
---flight-lines      Specific flight lines to process
---flight-list       Text file with flight line IDs
---diagnostics       Save diagnostic outputs
---continue-on-error Continue if a flight line fails
+--batch-dir     Batch output dir — mosaics all three products
+--mosaic-dir    Output directory for mosaics (default: mosaics)
+-i / --input    Input wildcard for single-product mosaic
+-o / --output   Output path (required with --input)
+--tile-size     Processing tile size in pixels (default: 2048)
+--edge-setback  Pixels to suppress at each swath edge (default: 50)
 ```
 
 ## Performance
 
-### Parallel Processing
+Processing uses **Numba JIT compilation** for all pixel-wise operations:
+- Band depth: chunked by rows with per-chunk progress bar
+- Grain size / anisotropy / RF: Numba `prange` across all CPU cores
+- Albedo + RF: computed in a single column-chunked pass to avoid materialising
+  the full spectral albedo array (~13 GB for a typical flight line)
 
-The package uses **Numba JIT compilation** for parallel pixel processing. This provides:
-- 5-10x speedup over pure Python
-- Automatic multi-core utilization via `prange`
-- No Dask overhead for pixel-wise operations
+**Measured performance** (10-core Mac, 451-band FENIX data, ~2700×2600 pixels):
 
-**With Numba (recommended):**
-- Grain size retrieval: ~5-10 seconds for 2000×2000 pixels
-- Total processing: ~30-60 seconds per flight line
+| Step | Time |
+|------|------|
+| LUT loading | ~11s |
+| Data loading | ~125s (disk I/O bound) |
+| Masking | ~10s |
+| Band depth (Numba) | ~11s |
+| Grain size (Numba) | <1s |
+| Anisotropy (Numba) | ~14s |
+| Albedo + RF (chunked) | ~30–40s |
+| **Total per flight line** | **~90s** |
 
-**Without Numba:**
-- Same operations: 3-10 minutes
-- Pure Python nested loops are the bottleneck
+## Algorithm Reference
 
-### Why Not Dask Parallelization?
-
-Dask's `map_blocks` with Python functions hits the Global Interpreter Lock (GIL). The inner pixel loops in the original code were pure Python, defeating Dask's parallelism. Numba's `prange` releases the GIL and enables true parallel execution.
-
-### Typical Processing Times
-
-| Operation | With Numba | Without Numba |
-|-----------|------------|---------------|
-| Band depth | 5-10s | 60-120s |
-| Grain size retrieval | 3-8s | 45-90s |
-| Anisotropy lookup | 5-15s | 60-180s |
-| **Total per flight line** | **30-60s** | **5-10 min** |
-
-*Times for 2000×2000 pixel image on 8-core CPU*
+- **ART Model**: Kokhanovsky & Zege (2004) "Scattering optics of snow"
+- **Terrain Correction**: Dumont et al. (2011) local viewing geometry
+- **Radiative Forcing**: Painter et al. (2013) integration method
 
 ## License
 
