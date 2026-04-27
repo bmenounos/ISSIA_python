@@ -286,7 +286,7 @@ def main():
         n_workers=args.workers
     )
 
-    if args.mosaic and results and results['successful']:
+    if args.mosaic and results and (results['successful'] or results['skipped']):
         from mosaic import mosaic_batch
         mosaic_dir = Path(args.mosaic_dir) if args.mosaic_dir else Path(args.output_dir) / 'mosaics'
         print(f"\nMosaicking {len(results['successful'])} flight lines...")
