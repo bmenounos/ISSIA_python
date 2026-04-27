@@ -249,19 +249,25 @@ def main():
                        help='Continue processing if a flight line fails')
     parser.add_argument('--workers', type=int, default=None,
                        help='Number of worker threads for parallel processing')
-    
+    parser.add_argument('--mosaic', action='store_true',
+                       help='After processing, mosaic all flight lines per product (gs, albedo, rf)')
+    parser.add_argument('--mosaic-dir', type=str, default=None,
+                       help='Output directory for mosaics (default: <output-dir>/mosaics)')
+    parser.add_argument('--edge-setback', type=int, default=50,
+                       help='Pixels to trim from swath edges before mosaic weighting')
+
     args = parser.parse_args()
-    
+
     # Determine flight lines to process
     flight_lines = None
-    
+
     if args.flight_lines:
         flight_lines = args.flight_lines
     elif args.flight_list:
         with open(args.flight_list, 'r') as f:
             flight_lines = [line.strip() for line in f if line.strip()]
-    
-    batch_process(
+
+    results = batch_process(
         data_dir=Path(args.data_dir),
         output_dir=Path(args.output_dir),
         lut_dir=Path(args.lut_dir),
@@ -271,6 +277,13 @@ def main():
         continue_on_error=args.continue_on_error,
         n_workers=args.workers
     )
+
+    if args.mosaic and results and results['successful']:
+        from mosaic import mosaic_batch
+        mosaic_dir = Path(args.mosaic_dir) if args.mosaic_dir else Path(args.output_dir) / 'mosaics'
+        print(f"\nMosaicking {len(results['successful'])} flight lines...")
+        mosaic_batch(Path(args.output_dir), mosaic_dir, edge_setback=args.edge_setback)
+        print(f"Mosaics saved to: {mosaic_dir}")
 
 
 if __name__ == "__main__":

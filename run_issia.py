@@ -367,23 +367,17 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
     steps.write(f"[6] Anisotropy: {time.time()-t0:.1f}s")
     steps.update(1)
 
-    # [7] Albedo
-    steps.set_description("[7] Albedo")
+    # [7+8] Albedo + Radiative forcing (single chunked pass — avoids 13 GB spectral albedo array)
+    steps.set_description("[7] Albedo+RF")
     t0 = time.time()
-    spectral_albedo = refl_masked * anisotropy
-    broadband_albedo = processor.calculate_broadband_albedo(spectral_albedo, global_flux)
-    if isinstance(broadband_albedo, da.Array):
-        broadband_albedo = broadband_albedo.compute()
+    broadband_albedo, rf_lap = processor.compute_albedo_rf_chunked(
+        refl_masked, anisotropy, global_flux, grain_size
+    )
     steps.write(f"[7] Albedo: {time.time()-t0:.1f}s")
     steps.update(1)
 
-    # [8] Radiative forcing
     steps.set_description("[8] Radiative forcing")
-    t0 = time.time()
-    rf_lap = processor.calculate_radiative_forcing(grain_size, spectral_albedo, global_flux)
-    if isinstance(rf_lap, da.Array):
-        rf_lap = rf_lap.compute()
-    steps.write(f"[8] Radiative forcing: {time.time()-t0:.1f}s")
+    steps.write(f"[8] Radiative forcing: (computed with albedo above)")
     steps.update(1)
     steps.close()
     

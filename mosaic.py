@@ -1,138 +1,219 @@
+"""
+Seamless weighted mosaic for ISSIA flight line products.
+
+Uses distance-transform edge weighting so overlap zones blend smoothly and
+ATCOR edge artifacts (strongest at flight line boundaries) are suppressed.
+
+Usage — single product:
+    python mosaic.py -i "output/*_albedo.tif" -o mosaic_albedo.tif
+
+Usage — all three products from a batch output directory:
+    python mosaic.py --batch-dir /path/to/output --mosaic-dir /path/to/mosaics
+
+Parameters:
+    --edge-setback   Pixels to trim from each flight line edge before distance
+                     weighting (default 50). Handles ATCOR correction artefacts
+                     that are strongest near the swath boundary.
+    --tile-size      Processing tile size in pixels (default 2048).
+"""
+
 import os
 import glob
 import argparse
+from pathlib import Path
+
 import numpy as np
 from osgeo import gdal
 from scipy.ndimage import distance_transform_edt
+from tqdm import tqdm
 
-def create_global_weight_map(file_path):
-    """
-    Calculates the weight map for the entire flightline relative to its 
-    actual data boundaries before any tiling occurs.
-    """
-    src_ds = gdal.Open(file_path)
-    if src_ds is None:
-        return None, None
-        
-    band = src_ds.GetRasterBand(1).ReadAsArray()
-    
-    # Identify valid data area
-    # Note: If 0 is a valid retrieval, use np.isnan(band) only
-    mask = np.where(np.isnan(band) | (band <= 0), 0, 1)
-    
-    # Calculate Euclidean Distance to the nearest NoData pixel
-    weight = distance_transform_edt(mask).astype(np.float32)
-    
-    # Normalize weights 0 to 1
-    max_dist = weight.max()
-    if max_dist > 0:
-        weight /= max_dist
-        
-    # Keep the weight map in a MEMory dataset for fast warping
-    mem_drv = gdal.GetDriverByName('MEM')
-    w_ds = mem_drv.Create('', src_ds.RasterXSize, src_ds.RasterYSize, 1, gdal.GDT_Float32)
-    w_ds.SetGeoTransform(src_ds.GetGeoTransform())
-    w_ds.SetProjection(src_ds.GetProjection())
-    w_ds.GetRasterBand(1).WriteArray(weight)
-    
-    return src_ds, w_ds
 
-def get_tile_data(src_ds, w_ds, target_vrt, x, y, win_x, win_y):
+PRODUCTS = ["gs", "albedo", "rf"]
+
+
+def _build_weight(band, edge_setback):
+    """Distance-transform weight for one flight line raster band.
+
+    Pixels within `edge_setback` of any nodata edge are forced to zero weight,
+    then the remaining valid region is weighted by distance to its own edge.
     """
-    Warps a specific window of both the data and the weight map 
-    into the target mosaic grid.
-    """
-    mem_drv = gdal.GetDriverByName('MEM')
-    orig_geo = target_vrt.GetGeoTransform()
-    
-    # Calculate the geo-transform for this specific tile/window
-    tile_geo = (
-        orig_geo[0] + x * orig_geo[1], orig_geo[1], 0,
-        orig_geo[3] + y * orig_geo[5], 0, orig_geo[5]
+    valid = np.where(np.isnan(band) | (band <= 0), 0, 1).astype(np.uint8)
+
+    if edge_setback > 0:
+        # Erode the valid mask by edge_setback pixels
+        from scipy.ndimage import binary_erosion
+        struct = np.ones((2 * edge_setback + 1, 2 * edge_setback + 1), dtype=bool)
+        valid = binary_erosion(valid, structure=struct, border_value=0).astype(np.uint8)
+
+    weight = distance_transform_edt(valid).astype(np.float32)
+    max_w = weight.max()
+    if max_w > 0:
+        weight /= max_w
+    return weight
+
+
+def _to_mem_ds(array, ref_ds):
+    """Wrap a numpy array in an in-memory GDAL dataset with the same georef as ref_ds."""
+    drv = gdal.GetDriverByName("MEM")
+    ds = drv.Create("", ref_ds.RasterXSize, ref_ds.RasterYSize, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform(ref_ds.GetGeoTransform())
+    ds.SetProjection(ref_ds.GetProjection())
+    ds.GetRasterBand(1).WriteArray(array)
+    return ds
+
+
+def _warp_tile(src_ds, target_ds, x, y, win_x, win_y):
+    """Reproject a spatial tile of src_ds onto the target grid."""
+    drv = gdal.GetDriverByName("MEM")
+    gt = target_ds.GetGeoTransform()
+    tile_gt = (
+        gt[0] + x * gt[1], gt[1], 0,
+        gt[3] + y * gt[5], 0, gt[5],
     )
-    
-    def warp_op(input_ds):
-        tmp_ds = mem_drv.Create('', win_x, win_y, 1, gdal.GDT_Float32)
-        tmp_ds.SetGeoTransform(tile_geo)
-        tmp_ds.SetProjection(target_vrt.GetProjection())
-        # Use Bilinear for smooth physical parameters (Albedo, Grain Size)
-        gdal.ReprojectImage(input_ds, tmp_ds, input_ds.GetProjection(), 
-                            target_vrt.GetProjection(), gdal.GRA_Bilinear)
-        return tmp_ds.GetRasterBand(1).ReadAsArray()
+    tmp = drv.Create("", win_x, win_y, 1, gdal.GDT_Float32)
+    tmp.SetGeoTransform(tile_gt)
+    tmp.SetProjection(target_ds.GetProjection())
+    gdal.ReprojectImage(src_ds, tmp,
+                        src_ds.GetProjection(), target_ds.GetProjection(),
+                        gdal.GRA_Bilinear)
+    return tmp.GetRasterBand(1).ReadAsArray()
 
-    data_tile = warp_op(src_ds)
-    weight_tile = warp_op(w_ds)
-    
-    # Replace NaNs with 0 for the weighted sum calculation
-    return np.nan_to_num(data_tile), np.nan_to_num(weight_tile)
 
-def main():
-    parser = argparse.ArgumentParser(description="Artifact-free weighted mosaic for physical retrievals.")
-    parser.add_argument("-i", "--input", required=True, help="Input wildcard (e.g. 'folder/*.tif')")
-    parser.add_argument("-o", "--output", required=True, help="Output filename")
-    parser.add_argument("-t", "--tile_size", type=int, default=2048, help="Tile size for processing")
-    
-    args = parser.parse_args()
+def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
+    """Create a seamless weighted mosaic from a list of GeoTIFF files.
 
-    # Resolve wildcard
-    files = glob.glob(args.input)
-    if not files:
-        print(f"No files found for: {args.input}")
+    Parameters
+    ----------
+    files : list[str]
+        Input GeoTIFF paths (one per flight line).
+    output_path : str | Path
+        Output mosaic GeoTIFF path.
+    tile_size : int
+        Spatial processing tile size in pixels.
+    edge_setback : int
+        Pixels to trim from each flight line edge before weighting.
+    """
+    files = sorted(files)
+    output_path = str(output_path)
+
+    print(f"  Mosaicking {len(files)} flight lines → {Path(output_path).name}")
+
+    # Pre-compute per-file weight maps (full resolution, stored in memory)
+    prepared = []
+    for f in tqdm(files, desc="  weights", leave=False):
+        src = gdal.Open(f)
+        if src is None:
+            tqdm.write(f"  Warning: cannot open {f}, skipping")
+            continue
+        band = src.GetRasterBand(1).ReadAsArray().astype(np.float32)
+        band[band == src.GetRasterBand(1).GetNoDataValue() or 0] = np.nan
+        w = _build_weight(band, edge_setback)
+        w_ds = _to_mem_ds(w, src)
+        prepared.append((src, w_ds))
+
+    if not prepared:
+        print("  No valid files found.")
         return
 
-    print(f"Step 1: Pre-calculating global weights for {len(files)} files...")
-    # Store tuples of (Source Dataset, Weight Dataset)
-    prepared = []
-    for f in files:
-        s_ds, w_ds = create_global_weight_map(f)
-        if s_ds:
-            prepared.append((s_ds, w_ds))
+    # Determine output extent via VRT
+    vrt_path = output_path + ".tmp.vrt"
+    gdal.BuildVRT(vrt_path, files)
+    vrt = gdal.Open(vrt_path)
+    x_total, y_total = vrt.RasterXSize, vrt.RasterYSize
 
-    # Determine Global Extent
-    temp_vrt_path = 'global_temp.vrt'
-    gdal.BuildVRT(temp_vrt_path, files)
-    vrt_ds = gdal.Open(temp_vrt_path)
-    x_total, y_total = vrt_ds.RasterXSize, vrt_ds.RasterYSize
-
-    # Create Output File
-    driver = gdal.GetDriverByName('GTiff')
-    out_ds = driver.Create(args.output, x_total, y_total, 1, gdal.GDT_Float32, 
-                           options=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=YES'])
-    out_ds.SetGeoTransform(vrt_ds.GetGeoTransform())
-    out_ds.SetProjection(vrt_ds.GetProjection())
+    # Create output GeoTIFF
+    drv = gdal.GetDriverByName("GTiff")
+    out_ds = drv.Create(output_path, x_total, y_total, 1, gdal.GDT_Float32,
+                        options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
+                                 "BLOCKXSIZE=512", "BLOCKYSIZE=512"])
+    out_ds.SetGeoTransform(vrt.GetGeoTransform())
+    out_ds.SetProjection(vrt.GetProjection())
     out_band = out_ds.GetRasterBand(1)
-    out_band.SetNoDataValue(np.nan)
+    out_band.SetNoDataValue(float("nan"))
 
-    print(f"Step 2: Processing mosaic in {args.tile_size}px tiles...")
-    
-    for y in range(0, y_total, args.tile_size):
-        win_y = min(args.tile_size, y_total - y)
-        for x in range(0, x_total, args.tile_size):
-            win_x = min(args.tile_size, x_total - x)
-            
-            tile_sum = np.zeros((win_y, win_x), dtype=np.float32)
-            tile_w_acc = np.zeros((win_y, win_x), dtype=np.float32)
-            
-            for s_ds, w_ds in prepared:
-                d_tile, w_tile = get_tile_data(s_ds, w_ds, vrt_ds, x, y, win_x, win_y)
-                tile_sum += (d_tile * w_tile)
-                tile_w_acc += w_tile
-            
-            # Divide by total weight to get the final feathered value
-            valid = tile_w_acc > 0
-            final_tile = np.full((win_y, win_x), np.nan, dtype=np.float32)
-            final_tile[valid] = tile_sum[valid] / tile_w_acc[valid]
-            
-            out_band.WriteArray(final_tile, x, y)
-        print(f" Progress: Row {y} of {y_total} complete")
+    n_tiles_y = (y_total + tile_size - 1) // tile_size
+    n_tiles_x = (x_total + tile_size - 1) // tile_size
+    n_tiles = n_tiles_y * n_tiles_x
 
-    print(f"Done! Clean mosaic saved to: {args.output}")
-    
-    # Cleanup
+    with tqdm(total=n_tiles, desc="  tiles", unit="tile", leave=False) as pbar:
+        for y in range(0, y_total, tile_size):
+            win_y = min(tile_size, y_total - y)
+            for x in range(0, x_total, tile_size):
+                win_x = min(tile_size, x_total - x)
+
+                tile_sum = np.zeros((win_y, win_x), dtype=np.float32)
+                tile_w = np.zeros((win_y, win_x), dtype=np.float32)
+
+                for src_ds, w_ds in prepared:
+                    d = _warp_tile(src_ds, vrt, x, y, win_x, win_y)
+                    w = _warp_tile(w_ds, vrt, x, y, win_x, win_y)
+                    np.nan_to_num(d, copy=False)
+                    np.nan_to_num(w, copy=False)
+                    tile_sum += d * w
+                    tile_w += w
+
+                valid = tile_w > 0
+                result = np.full((win_y, win_x), np.nan, dtype=np.float32)
+                result[valid] = tile_sum[valid] / tile_w[valid]
+                out_band.WriteArray(result, x, y)
+                pbar.update(1)
+
+    out_ds.FlushCache()
     out_ds = None
-    vrt_ds = None
-    if os.path.exists(temp_vrt_path):
-        os.remove(temp_vrt_path)
+    vrt = None
+    if os.path.exists(vrt_path):
+        os.remove(vrt_path)
+
+    print(f"  Saved: {output_path}")
+
+
+def mosaic_batch(batch_dir, mosaic_dir, tile_size=2048, edge_setback=50):
+    """Mosaic all three products (gs, albedo, rf) from a batch output directory."""
+    batch_dir = Path(batch_dir)
+    mosaic_dir = Path(mosaic_dir)
+    mosaic_dir.mkdir(parents=True, exist_ok=True)
+
+    for product in PRODUCTS:
+        files = sorted(batch_dir.glob(f"*_{product}.tif"))
+        if not files:
+            print(f"  No {product} files found in {batch_dir}")
+            continue
+        out_path = mosaic_dir / f"mosaic_{product}.tif"
+        mosaic_files([str(f) for f in files], out_path,
+                     tile_size=tile_size, edge_setback=edge_setback)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Seamless weighted mosaic for ISSIA flight line products.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-i", "--input", help="Input wildcard, e.g. 'folder/*_albedo.tif'")
+    group.add_argument("--batch-dir", help="Batch output dir — mosaics all three products")
+
+    parser.add_argument("-o", "--output", help="Output path (required with --input)")
+    parser.add_argument("--mosaic-dir", default="mosaics",
+                        help="Output dir for mosaics (used with --batch-dir)")
+    parser.add_argument("--tile-size", type=int, default=2048)
+    parser.add_argument("--edge-setback", type=int, default=50,
+                        help="Pixels to trim from swath edges before weighting")
+
+    args = parser.parse_args()
+
+    if args.batch_dir:
+        mosaic_batch(args.batch_dir, args.mosaic_dir,
+                     tile_size=args.tile_size, edge_setback=args.edge_setback)
+    else:
+        if not args.output:
+            parser.error("--output is required when using --input")
+        files = glob.glob(args.input)
+        if not files:
+            print(f"No files found for: {args.input}")
+            return
+        mosaic_files(files, args.output,
+                     tile_size=args.tile_size, edge_setback=args.edge_setback)
+
 
 if __name__ == "__main__":
     main()

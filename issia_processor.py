@@ -478,6 +478,70 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
         
         return da.from_array(result, chunks=self.chunk_size)
 
+    def compute_albedo_rf_chunked(self, refl_masked, anisotropy, global_flux, grain_size,
+                                   chunk_cols=256):
+        """Compute broadband albedo and radiative forcing in column chunks.
+
+        Avoids materializing the full spectral albedo array (~13 GB) by computing
+        both products from the same spatial chunk, then discarding it.
+
+        Returns
+        -------
+        broadband_albedo : np.ndarray (rows, cols)
+        rf              : np.ndarray (rows, cols)
+        """
+        from tqdm import tqdm
+
+        wvl_um = (self.wavelengths / 1000.0).astype(np.float32)
+        rf_mask = (self.wavelengths <= 1000)
+
+        refl = refl_masked.astype(np.float32)
+        aniso = anisotropy.astype(np.float32)
+        flux = (global_flux.compute() if isinstance(global_flux, da.Array) else global_flux).astype(np.float32)
+        gs = (grain_size.compute() if isinstance(grain_size, da.Array) else grain_size).astype(np.float32)
+
+        rows, cols = refl.shape[1], refl.shape[2]
+        broadband = np.full((rows, cols), np.nan, dtype=np.float32)
+        rf = np.full((rows, cols), np.nan, dtype=np.float32)
+
+        den_full = np.trapz(flux, x=wvl_um, axis=0)  # (rows, cols) — flux denominator
+
+        with tqdm(total=cols, desc="    albedo+RF", unit="col", leave=False) as pbar:
+            for c0 in range(0, cols, chunk_cols):
+                c1 = min(c0 + chunk_cols, cols)
+
+                sa = refl[:, :, c0:c1] * aniso[:, :, c0:c1]
+                fx = flux[:, :, c0:c1]
+
+                # Broadband albedo
+                num = np.trapz(sa * fx, x=wvl_um, axis=0)
+                den = den_full[:, c0:c1]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    broadband[:, c0:c1] = np.where(den > 0, (num / den).astype(np.float32), np.nan)
+
+                # Radiative forcing
+                if HAS_NUMBA:
+                    rf[:, c0:c1] = _process_rf_numba(
+                        sa, fx, gs[:, c0:c1], wvl_um,
+                        self.albedo_lut, self._grain_radii_f32, rf_mask
+                    )
+                else:
+                    nc = c1 - c0
+                    for i in range(rows):
+                        for j in range(nc):
+                            g = gs[i, c0 + j]
+                            if np.isnan(g) or g <= 0:
+                                continue
+                            gs_idx = np.argmin(np.abs(self._grain_radii_f32 - g))
+                            clean = self.albedo_lut[gs_idx, rf_mask]
+                            diff = np.maximum(0.0, clean - sa[rf_mask, i, j])
+                            rf[i, c0 + j] = np.trapz(diff * fx[rf_mask, i, j] * 1000.0,
+                                                      wvl_um[rf_mask])
+
+                pbar.update(c1 - c0)
+
+        return broadband, rf
+
 
 # Alias for backward compatibility
 ISSIAProcessorNotebook = ISSIAProcessorOptimized
