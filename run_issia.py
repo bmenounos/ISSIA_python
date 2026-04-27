@@ -18,6 +18,7 @@ from scipy.spatial import ConvexHull
 from scipy.signal import savgol_filter
 import dask.array as da
 import os
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -195,16 +196,23 @@ def _process_bd_row(i):
         _output[i, j] = continuum_removal_830_1130(smoothed, _wvl)
     return i
 
-def parallel_band_depth(spec_block, wavelengths):
+def parallel_band_depth(spec_block, wavelengths, chunk_rows=256):
     """Calculate band depth - uses Numba JIT if available, else shared memory fallback"""
     if HAS_NUMBA:
         left_idx = np.argmin(np.abs(wavelengths - 900.0))
         right_idx = np.argmin(np.abs(wavelengths - 1130.0))
-        return _parallel_band_depth_numba(
-            spec_block.astype(np.float32),
-            wavelengths.astype(np.float32),
-            left_idx, right_idx
-        )
+        spec_f32 = spec_block.astype(np.float32)
+        wl_f32 = wavelengths.astype(np.float32)
+        rows = spec_f32.shape[1]
+        result = np.full((rows, spec_f32.shape[2]), np.nan, dtype=np.float32)
+        with tqdm(total=rows, desc="    band depth", unit="row", leave=False) as pbar:
+            for r0 in range(0, rows, chunk_rows):
+                r1 = min(r0 + chunk_rows, rows)
+                result[r0:r1] = _parallel_band_depth_numba(
+                    spec_f32[:, r0:r1, :], wl_f32, left_idx, right_idx
+                )
+                pbar.update(r1 - r0)
+        return result
 
     from multiprocessing import Pool, shared_memory
 
@@ -262,107 +270,122 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
         n_workers=n_workers
     )
     
-    # Load lookup tables
+    steps = tqdm(total=9, desc="  pipeline", unit="step", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+
+    # [0] Load lookup tables
+    steps.set_description("[0] LUT loading")
     t0 = time.time()
     processor.load_lookup_tables(
         sbd_path=lut_dir / "sbd_lut.npy",
         aniso_path=lut_dir / "anisotropy_lut.npz",
         alb_path=lut_dir / "albedo_lut.npy"
     )
-    print(f"[0] LUT loading: {time.time()-t0:.1f}s")
-    
-    # Read ATCOR files
+    steps.write(f"[0] LUT loading: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [1] Read ATCOR files
+    steps.set_description("[1] Data loading")
     t0 = time.time()
     data = processor.read_atcor_files(data_dir, flight_line, subset=subset)
-    
-    # Compute reflectance upfront for efficiency
     reflectance = data['reflectance'].compute()
     global_flux = data['global_flux'].compute()
     slope = data['slope'].compute() if isinstance(data['slope'], da.Array) else data['slope']
     aspect = data['aspect'].compute() if isinstance(data['aspect'], da.Array) else data['aspect']
-    
-    print(f"[1] Data loading: {time.time()-t0:.1f}s | Shape: {reflectance.shape}")
-    
-    # Create masks
+    steps.write(f"[1] Data loading: {time.time()-t0:.1f}s | Shape: {reflectance.shape}")
+    steps.update(1)
+
+    # [2] Masking
+    steps.set_description("[2] Masking")
     t0 = time.time()
     local_illum = processor.calculate_local_illumination_angle(
         data['solar_zenith'], data['solar_azimuth'], slope, aspect
     )
     if isinstance(local_illum, da.Array):
         local_illum = local_illum.compute()
-    
+
     idx_600 = np.argmin(np.abs(wavelengths - 600))
     idx_1500 = np.argmin(np.abs(wavelengths - 1500))
     ndsi = (reflectance[idx_600] - reflectance[idx_1500]) / \
            (reflectance[idx_600] + reflectance[idx_1500] + 1e-10)
-    
+
     geometric_mask = (local_illum <= 85)
     snow_mask = (ndsi >= 0.87)
-    
+
     idx_560 = np.argmin(np.abs(wavelengths - 560))
     shadow_ratio = reflectance[0] / (reflectance[idx_560] + 1e-10)
     shadow_mask = (shadow_ratio <= 1.0)
-    
+
     final_mask = geometric_mask & snow_mask & shadow_mask
-    # Apply mask in-place to avoid a full copy of the reflectance array
     reflectance[:, ~final_mask] = np.nan
     refl_masked = reflectance
 
     n_valid = np.sum(final_mask)
-    print(f"[2] Masking: {time.time()-t0:.1f}s | Valid pixels: {n_valid:,} ({100*n_valid/final_mask.size:.1f}%)")
-    
-    # Calculate band depth
+    steps.write(f"[2] Masking: {time.time()-t0:.1f}s | Valid pixels: {n_valid:,} ({100*n_valid/final_mask.size:.1f}%)")
+    steps.update(1)
+
+    # [3] Band depth
+    steps.set_description("[3] Band depth")
     t0 = time.time()
     band_depths = parallel_band_depth(refl_masked, wavelengths)
-    print(f"[3] Band depth: {time.time()-t0:.1f}s")
-    
-    # Calculate terrain-corrected viewing geometry
+    steps.write(f"[3] Band depth: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [4] Viewing geometry
+    steps.set_description("[4] Viewing geometry")
     t0 = time.time()
     theta_i_eff, theta_v_eff, raa_eff = processor.calculate_local_viewing_geometry(
-        data['solar_zenith'], data['solar_azimuth'], 
+        data['solar_zenith'], data['solar_azimuth'],
         slope, aspect,
         viewing_zenith=0.0, viewing_azimuth=0.0
     )
-    print(f"[4] Viewing geometry: {time.time()-t0:.1f}s")
-    
-    # Pixel-wise grain size retrieval
+    steps.write(f"[4] Viewing geometry: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [5] Grain size
+    steps.set_description("[5] Grain size")
     t0 = time.time()
     grain_size = processor.retrieve_grain_size_pixelwise(
         band_depths, theta_i_eff, theta_v_eff, raa_eff
     )
     if isinstance(grain_size, da.Array):
         grain_size = grain_size.compute()
-    print(f"[5] Grain size: {time.time()-t0:.1f}s")
-    
-    # Pixel-wise anisotropy
+    steps.write(f"[5] Grain size: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [6] Anisotropy
+    steps.set_description("[6] Anisotropy")
     t0 = time.time()
     anisotropy = processor.calculate_anisotropy_factor_pixelwise(
         grain_size, theta_i_eff, theta_v_eff, raa_eff
     )
     if isinstance(anisotropy, da.Array):
         anisotropy = anisotropy.compute()
-    
-    # Ensure correct shape
     if anisotropy.ndim == 3:
         anisotropy_2d = anisotropy[0]
     else:
         anisotropy_2d = anisotropy
-    print(f"[6] Anisotropy: {time.time()-t0:.1f}s")
-    
-    # Calculate albedo
+    steps.write(f"[6] Anisotropy: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [7] Albedo
+    steps.set_description("[7] Albedo")
     t0 = time.time()
     spectral_albedo = refl_masked * anisotropy
     broadband_albedo = processor.calculate_broadband_albedo(spectral_albedo, global_flux)
     if isinstance(broadband_albedo, da.Array):
         broadband_albedo = broadband_albedo.compute()
-    print(f"[7] Albedo: {time.time()-t0:.1f}s")
-    
-    # Calculate radiative forcing
+    steps.write(f"[7] Albedo: {time.time()-t0:.1f}s")
+    steps.update(1)
+
+    # [8] Radiative forcing
+    steps.set_description("[8] Radiative forcing")
     t0 = time.time()
     rf_lap = processor.calculate_radiative_forcing(grain_size, spectral_albedo, global_flux)
     if isinstance(rf_lap, da.Array):
         rf_lap = rf_lap.compute()
-    print(f"[8] Radiative forcing: {time.time()-t0:.1f}s")
+    steps.write(f"[8] Radiative forcing: {time.time()-t0:.1f}s")
+    steps.update(1)
+    steps.close()
     
     # Print summary
     total_time = time.time() - t0_total
