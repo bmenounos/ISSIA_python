@@ -249,7 +249,8 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
     # Initialize optimized processor
     processor = ISSIAProcessorOptimized(
         wavelengths=wavelengths,
-        grain_radii=np.arange(30, 10001, 30),
+        #grain_radii=np.arange(30, 10001, 30),
+        grain_radii=np.arange(30, 5001, 30), 
         illumination_angles=np.arange(0, 86, 5),
         viewing_angles=np.arange(0, 86, 5),
         relative_azimuths=np.arange(0, 361, 10),

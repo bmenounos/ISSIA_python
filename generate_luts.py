@@ -185,7 +185,8 @@ def generate_luts(wvl_path, iop_path, output_dir, num_workers=None):
     print(f"Ice optical properties loaded")
     
     # Define LUT dimensions
-    grain_radii = np.arange(30, 10001, 30)  # 30:30:10000 µm (333 values)
+    #grain_radii = np.arange(30, 10001, 30)  # 30:30:10000 µm (333 values)
+    grain_radii = np.arange(30, 5001, 30) 
     illum_angles = np.arange(0, 86, 5)       # 0:5:85° (18 values)
     view_angles = np.arange(0, 86, 5)        # 0:5:85° (18 values)
     azim_angles = np.arange(0, 361, 10)      # 0:10:360° (37 values)
