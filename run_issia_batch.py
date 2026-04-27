@@ -289,8 +289,11 @@ def main():
     if args.mosaic and results and (results['successful'] or results['skipped']):
         from mosaic import mosaic_batch
         mosaic_dir = Path(args.mosaic_dir) if args.mosaic_dir else Path(args.output_dir) / 'mosaics'
-        print(f"\nMosaicking {len(results['successful'])} flight lines...")
-        mosaic_batch(Path(args.output_dir), mosaic_dir, edge_setback=args.edge_setback)
+        n_ready = len(results['successful']) + len(results['skipped'])
+        print(f"\nMosaicking {n_ready} flight lines...")
+        all_lines = results['successful'] + results['skipped']
+        mosaic_batch(Path(args.output_dir), mosaic_dir, edge_setback=args.edge_setback,
+                     flight_lines=all_lines)
         print(f"Mosaics saved to: {mosaic_dir}")
 
 

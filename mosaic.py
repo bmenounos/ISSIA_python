@@ -117,9 +117,10 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
         print("  No valid files found.")
         return
 
-    # Determine output extent via VRT
+    # Determine output extent via VRT — force Float32 so mixed-type files don't cause skips
     vrt_path = output_path + ".tmp.vrt"
-    gdal.BuildVRT(vrt_path, files)
+    gdal.BuildVRT(vrt_path, files,
+                  options=gdal.BuildVRTOptions(outputType=gdal.GDT_Float32))
     vrt = gdal.Open(vrt_path)
     x_total, y_total = vrt.RasterXSize, vrt.RasterYSize
 
@@ -169,14 +170,33 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
     print(f"  Saved: {output_path}")
 
 
-def mosaic_batch(batch_dir, mosaic_dir, tile_size=2048, edge_setback=50):
-    """Mosaic all three products (gs, albedo, rf) from a batch output directory."""
+def mosaic_batch(batch_dir, mosaic_dir, tile_size=2048, edge_setback=50,
+                 flight_lines=None):
+    """Mosaic all three products (gs, albedo, rf) from a batch output directory.
+
+    Parameters
+    ----------
+    flight_lines : list[str], optional
+        If provided, only mosaic files belonging to these flight line IDs.
+        Prevents stale files from other acquisitions mixing into the mosaic.
+    """
     batch_dir = Path(batch_dir)
     mosaic_dir = Path(mosaic_dir)
     mosaic_dir.mkdir(parents=True, exist_ok=True)
 
     for product in PRODUCTS:
-        files = sorted(batch_dir.glob(f"*_{product}.tif"))
+        if flight_lines is not None:
+            files = sorted(
+                batch_dir / f"{fl}_{product}.tif"
+                for fl in flight_lines
+                if (batch_dir / f"{fl}_{product}.tif").exists()
+            )
+        else:
+            files = sorted(batch_dir.glob(f"*_{product}.tif"))
+
+        # Exclude any existing mosaic outputs from the input list
+        files = [f for f in files if not Path(f).name.startswith("mosaic_")]
+
         if not files:
             print(f"  No {product} files found in {batch_dir}")
             continue
