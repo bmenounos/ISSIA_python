@@ -34,18 +34,22 @@ PRODUCTS = ["gs", "albedo", "rf"]
 def _build_weight(band, edge_setback):
     """Distance-transform weight for one flight line raster band.
 
-    Pixels within `edge_setback` of any nodata edge are forced to zero weight,
-    then the remaining valid region is weighted by distance to its own edge.
+    Each valid pixel's weight is its distance to the nearest nodata pixel,
+    minus edge_setback (so swath-edge pixels ramp to zero smoothly).
+    If the valid region is so thin that all weights would be zero after the
+    setback, the setback is ignored — this prevents narrow snow patches from
+    being completely suppressed.
     """
     valid = np.where(np.isnan(band) | (band <= 0), 0, 1).astype(np.uint8)
+    dist = distance_transform_edt(valid).astype(np.float32)
 
     if edge_setback > 0:
-        # Erode the valid mask by edge_setback pixels
-        from scipy.ndimage import binary_erosion
-        struct = np.ones((2 * edge_setback + 1, 2 * edge_setback + 1), dtype=bool)
-        valid = binary_erosion(valid, structure=struct, border_value=0).astype(np.uint8)
+        weight = np.maximum(0.0, dist - edge_setback)
+        if weight.max() == 0:
+            weight = dist  # fall back: valid region too thin for the setback
+    else:
+        weight = dist
 
-    weight = distance_transform_edt(valid).astype(np.float32)
     max_w = weight.max()
     if max_w > 0:
         weight /= max_w
