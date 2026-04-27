@@ -79,6 +79,33 @@ def _warp_tile(src_ds, target_ds, x, y, win_x, win_y):
     return tmp.GetRasterBand(1).ReadAsArray()
 
 
+def _union_extent(files):
+    """Compute the union bounding box of all files and return (geotransform, projection, nx, ny)."""
+    min_x = float("inf");  max_x = float("-inf")
+    min_y = float("inf");  max_y = float("-inf")
+    ref_proj = None;  res_x = res_y = None
+
+    for f in files:
+        ds = gdal.Open(str(f))
+        if ds is None:
+            continue
+        gt = ds.GetGeoTransform()
+        nx, ny = ds.RasterXSize, ds.RasterYSize
+        x0, y0 = gt[0], gt[3]
+        x1 = x0 + nx * gt[1]
+        y1 = y0 + ny * gt[5]
+        min_x = min(min_x, min(x0, x1));  max_x = max(max_x, max(x0, x1))
+        min_y = min(min_y, min(y0, y1));  max_y = max(max_y, max(y0, y1))
+        if ref_proj is None:
+            ref_proj = ds.GetProjection()
+            res_x, res_y = gt[1], gt[5]
+
+    out_nx = int(round((max_x - min_x) / res_x))
+    out_ny = int(round((min_y - max_y) / res_y))
+    out_gt = (min_x, res_x, 0.0, max_y, 0.0, res_y)
+    return out_gt, ref_proj, out_nx, out_ny
+
+
 def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
     """Create a seamless weighted mosaic from a list of GeoTIFF files.
 
@@ -117,20 +144,16 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
         print("  No valid files found.")
         return
 
-    # Determine output extent via VRT — force Float32 so mixed-type files don't cause skips
-    vrt_path = output_path + ".tmp.vrt"
-    gdal.BuildVRT(vrt_path, files,
-                  options=gdal.BuildVRTOptions(outputType=gdal.GDT_Float32))
-    vrt = gdal.Open(vrt_path)
-    x_total, y_total = vrt.RasterXSize, vrt.RasterYSize
+    # Compute output extent from all files directly (avoids VRT data-type issues)
+    out_gt, out_proj, x_total, y_total = _union_extent(files)
 
     # Create output GeoTIFF
     drv = gdal.GetDriverByName("GTiff")
     out_ds = drv.Create(output_path, x_total, y_total, 1, gdal.GDT_Float32,
                         options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
                                  "BLOCKXSIZE=512", "BLOCKYSIZE=512"])
-    out_ds.SetGeoTransform(vrt.GetGeoTransform())
-    out_ds.SetProjection(vrt.GetProjection())
+    out_ds.SetGeoTransform(out_gt)
+    out_ds.SetProjection(out_proj)
     out_band = out_ds.GetRasterBand(1)
     out_band.SetNoDataValue(float("nan"))
 
@@ -148,8 +171,8 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
                 tile_w = np.zeros((win_y, win_x), dtype=np.float32)
 
                 for src_ds, w_ds in prepared:
-                    d = _warp_tile(src_ds, vrt, x, y, win_x, win_y)
-                    w = _warp_tile(w_ds, vrt, x, y, win_x, win_y)
+                    d = _warp_tile(src_ds, out_ds, x, y, win_x, win_y)
+                    w = _warp_tile(w_ds, out_ds, x, y, win_x, win_y)
                     np.nan_to_num(d, copy=False)
                     np.nan_to_num(w, copy=False)
                     tile_sum += d * w
@@ -163,9 +186,6 @@ def mosaic_files(files, output_path, tile_size=2048, edge_setback=50):
 
     out_ds.FlushCache()
     out_ds = None
-    vrt = None
-    if os.path.exists(vrt_path):
-        os.remove(vrt_path)
 
     print(f"  Saved: {output_path}")
 
