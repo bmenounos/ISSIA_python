@@ -144,6 +144,13 @@ def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
         print(f"# Flight line {i}/{len(flight_lines)}: {flight_line}")
         print(f"{'#'*70}")
         
+        # Skip if all three outputs already exist
+        expected = [output_dir / f"{flight_line}_{p}.tif" for p in ("gs", "albedo", "rf")]
+        if all(p.exists() for p in expected):
+            print(f"  ↩ Skipping (outputs exist)")
+            results['skipped'].append(flight_line)
+            continue
+
         try:
             t0 = time.time()
             output_files = process_flight_line(
@@ -186,7 +193,8 @@ def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
     print("="*70)
     print(f"Total time: {total_time/60:.1f} minutes")
     print(f"Successful: {len(results['successful'])}/{len(flight_lines)}")
-    print(f"Failed: {len(results['failed'])}")
+    print(f"Skipped:    {len(results['skipped'])} (outputs already exist)")
+    print(f"Failed:     {len(results['failed'])}")
     
     if results['failed']:
         print(f"\nFailed flight lines:")
