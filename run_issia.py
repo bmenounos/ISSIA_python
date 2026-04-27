@@ -196,36 +196,40 @@ def _process_bd_row(i):
     return i
 
 def parallel_band_depth(spec_block, wavelengths):
-    """Calculate band depth using shared memory multiprocessing"""
+    """Calculate band depth - uses Numba JIT if available, else shared memory fallback"""
+    if HAS_NUMBA:
+        left_idx = np.argmin(np.abs(wavelengths - 900.0))
+        right_idx = np.argmin(np.abs(wavelengths - 1130.0))
+        return _parallel_band_depth_numba(
+            spec_block.astype(np.float32),
+            wavelengths.astype(np.float32),
+            left_idx, right_idx
+        )
+
     from multiprocessing import Pool, shared_memory
-    
+
     spec_block = spec_block.astype(np.float32)
     rows, cols = spec_block.shape[1], spec_block.shape[2]
     n_workers = os.cpu_count()
     print(f"    Using {n_workers} processes with shared memory...")
-    
-    # Create shared memory for input
+
     shm = shared_memory.SharedMemory(create=True, size=spec_block.nbytes)
     shared_arr = np.ndarray(spec_block.shape, dtype=spec_block.dtype, buffer=shm.buf)
     shared_arr[:] = spec_block[:]
-    
-    # Create shared memory for output
+
     out_shm = shared_memory.SharedMemory(create=True, size=rows * cols * 4)
     output = np.ndarray((rows, cols), dtype=np.float32, buffer=out_shm.buf)
     output[:] = np.nan
-    
+
     try:
-        with Pool(n_workers, initializer=_init_bd_worker, 
+        with Pool(n_workers, initializer=_init_bd_worker,
                   initargs=(shm.name, out_shm.name, spec_block.shape, wavelengths)) as pool:
             list(pool.imap_unordered(_process_bd_row, range(rows)))
-        
         result = output.copy()
     finally:
-        shm.close()
-        shm.unlink()
-        out_shm.close()
-        out_shm.unlink()
-    
+        shm.close(); shm.unlink()
+        out_shm.close(); out_shm.unlink()
+
     return result
 
 
@@ -300,8 +304,10 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
     shadow_mask = (shadow_ratio <= 1.0)
     
     final_mask = geometric_mask & snow_mask & shadow_mask
-    refl_masked = np.where(final_mask, reflectance, np.nan)
-    
+    # Apply mask in-place to avoid a full copy of the reflectance array
+    reflectance[:, ~final_mask] = np.nan
+    refl_masked = reflectance
+
     n_valid = np.sum(final_mask)
     print(f"[2] Masking: {time.time()-t0:.1f}s | Valid pixels: {n_valid:,} ({100*n_valid/final_mask.size:.1f}%)")
     
