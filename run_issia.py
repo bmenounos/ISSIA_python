@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 """
-ISSIA - Optimized Single Flight Line Processing
+ISSIA - Single Flight Line Processing (chunked, constant-memory)
 
-Uses Numba JIT compilation for 5-10x speedup over pure Python.
-All pixel-wise operations are parallelized across CPU cores.
+All data is read and processed in spatial row-strips so that peak RAM stays
+constant regardless of flight-line size.  Only one strip (~chunk_rows rows) of
+reflectance and flux is live at a time; results are written incrementally.
 
 Usage:
-    python run_issia_optimized.py --data-dir /path/to/data --flight-line flight_id --output-dir /path/to/output
+    python run_issia.py --data-dir /path/to/data --flight-line flight_id --output-dir /path/to/output
+    python run_issia.py ... --chunk-rows 128   # reduce for very tight RAM
 """
 
+import contextlib
 import numpy as np
+import rasterio
 import argparse
 import time
 from pathlib import Path
@@ -241,180 +245,254 @@ def parallel_band_depth(spec_block, wavelengths, chunk_rows=256):
     return result
 
 
+def _read_hdr_scale_factor(dat_path):
+    """Return the scale factor from an ENVI .hdr, defaulting to 1.0."""
+    hdr = str(dat_path).replace('.dat', '.hdr')
+    try:
+        with open(hdr, 'r') as f:
+            for line in f:
+                if 'reflectance scale factor' in line.lower():
+                    return float(line.split('=')[1].strip())
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return 1.0
+
+
+def _create_output_tiff(path, height, width, transform, crs):
+    """Open a single-band float32 GeoTIFF for incremental windowed writing."""
+    return rasterio.open(
+        str(path), 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=1,
+        dtype='float32',
+        crs=crs,
+        transform=transform,
+        compress='lzw',
+        nodata=float('nan'),
+    )
+
+
 def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
-                       subset=None, save_diagnostics=False, n_workers=None):
+                        subset=None, save_diagnostics=False, n_workers=None,
+                        chunk_rows=256):
     """
-    Process a single flight line with optimized parallelization
+    Process a single flight line with constant peak-memory chunked I/O.
+
+    Each iteration reads `chunk_rows` rows from every source file, runs the
+    full retrieval pipeline on that strip, writes the results, then discards
+    the strip.  Peak RAM ≈ chunk_rows × n_cols × n_bands × ~3 arrays, so a
+    25 GB flight line with chunk_rows=256 typically needs < 3 GB at peak.
     """
-    print("="*70)
-    print(f"ISSIA OPTIMIZED PROCESSING")
-    print(f"Flight line: {flight_line}")
-    print(f"Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED (install numba for 5-10x speedup)'}")
-    print(f"CPU cores: {os.cpu_count()}")
-    print("="*70)
-    
     t0_total = time.time()
-    
-    # Load wavelengths
+    data_dir   = Path(data_dir)
+    output_dir = Path(output_dir)
+    lut_dir    = Path(lut_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"ISSIA CHUNKED PROCESSING  |  flight line: {flight_line}")
+    print(f"Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED'}  |  "
+          f"cores: {os.cpu_count()}  |  chunk_rows: {chunk_rows}")
+    print("=" * 70)
+
     wavelengths = np.load(wvl_path)
-    
-    # Initialize optimized processor
+
+    # [0] Processor + LUTs — loaded once, reused across all chunks
+    print("[0] Loading LUTs...")
+    t0 = time.time()
     processor = ISSIAProcessorOptimized(
         wavelengths=wavelengths,
-        #grain_radii=np.arange(30, 10001, 30),
-        grain_radii=np.arange(30, 5001, 30), 
+        grain_radii=np.arange(30, 5001, 30),
         illumination_angles=np.arange(0, 86, 5),
         viewing_angles=np.arange(0, 86, 5),
         relative_azimuths=np.arange(0, 361, 10),
-        chunk_size=(1024, 1024),
-        n_workers=n_workers
+        chunk_size=(chunk_rows, chunk_rows),
+        n_workers=n_workers,
     )
-    
-    steps = tqdm(total=9, desc="  pipeline", unit="step", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-
-    # [0] Load lookup tables
-    steps.set_description("[0] LUT loading")
-    t0 = time.time()
     processor.load_lookup_tables(
         sbd_path=lut_dir / "sbd_lut.npy",
         aniso_path=lut_dir / "anisotropy_lut.npz",
-        alb_path=lut_dir / "albedo_lut.npy"
+        alb_path=lut_dir / "albedo_lut.npy",
     )
-    steps.write(f"[0] LUT loading: {time.time()-t0:.1f}s")
-    steps.update(1)
+    print(f"[0] LUTs loaded in {time.time()-t0:.1f}s")
 
-    # [1] Read ATCOR files
-    steps.set_description("[1] Data loading")
-    t0 = time.time()
-    data = processor.read_atcor_files(data_dir, flight_line, subset=subset)
-    reflectance = data['reflectance'].compute()
-    global_flux = data['global_flux'].compute()
-    slope = data['slope'].compute() if isinstance(data['slope'], da.Array) else data['slope']
-    aspect = data['aspect'].compute() if isinstance(data['aspect'], da.Array) else data['aspect']
-    steps.write(f"[1] Data loading: {time.time()-t0:.1f}s | Shape: {reflectance.shape}")
-    steps.update(1)
+    # Source file paths
+    atm_path = data_dir / f"{flight_line}_atm.dat"
+    eglo_path = data_dir / f"{flight_line}_eglo.dat"
+    slp_path  = data_dir / f"{flight_line}_slp.dat"
+    asp_path  = data_dir / f"{flight_line}_asp.dat"
+    inn_path  = data_dir / f"{flight_line}.inn"
 
-    # [2] Masking
-    steps.set_description("[2] Masking")
-    t0 = time.time()
-    local_illum = processor.calculate_local_illumination_angle(
-        data['solar_zenith'], data['solar_azimuth'], slope, aspect
-    )
-    if isinstance(local_illum, da.Array):
-        local_illum = local_illum.compute()
+    atm_scale  = _read_hdr_scale_factor(atm_path)
+    eglo_scale = _read_hdr_scale_factor(eglo_path)
+    solar_zenith, solar_azimuth = processor._read_solar_zenith(inn_path)
 
-    idx_600 = np.argmin(np.abs(wavelengths - 600))
-    idx_1500 = np.argmin(np.abs(wavelengths - 1500))
-    ndsi = (reflectance[idx_600] - reflectance[idx_1500]) / \
-           (reflectance[idx_600] + reflectance[idx_1500] + 1e-10)
+    # Band indices computed once
+    idx_600  = int(np.argmin(np.abs(wavelengths - 600)))
+    idx_1500 = int(np.argmin(np.abs(wavelengths - 1500)))
+    idx_560  = int(np.argmin(np.abs(wavelengths - 560)))
 
-    geometric_mask = (local_illum <= 85)
-    snow_mask = (ndsi >= 0.87)
+    # Raster geometry
+    with rasterio.open(str(atm_path)) as src:
+        src_height, src_width = src.height, src.width
+        src_transform = src.transform
+        crs = src.crs
+        if subset:
+            ymin, ymax, xmin, xmax = subset
+            col_off, row_off = xmin, ymin
+            height, width = ymax - ymin, xmax - xmin
+            out_transform = src.window_transform(
+                rasterio.windows.Window(col_off, row_off, width, height))
+        else:
+            col_off, row_off = 0, 0
+            height, width = src_height, src_width
+            out_transform = src_transform
 
-    idx_560 = np.argmin(np.abs(wavelengths - 560))
-    shadow_ratio = reflectance[0] / (reflectance[idx_560] + 1e-10)
-    shadow_mask = (shadow_ratio <= 1.0)
+    n_chunks = (height + chunk_rows - 1) // chunk_rows
+    print(f"[1] Raster: {height} rows × {width} cols | {n_chunks} chunks")
 
-    final_mask = geometric_mask & snow_mask & shadow_mask
-    reflectance[:, ~final_mask] = np.nan
-    refl_masked = reflectance
+    # Output file paths
+    gs_path  = output_dir / f"{flight_line}_gs.tif"
+    alb_path = output_dir / f"{flight_line}_albedo.tif"
+    rf_path  = output_dir / f"{flight_line}_rf.tif"
+    diag_keys = ['slope', 'theta_i', 'theta_v', 'bd'] if save_diagnostics else []
+    diag_paths = {
+        'slope':  output_dir / f"{flight_line}_slope.tif",
+        'theta_i': output_dir / f"{flight_line}_theta_i_eff.tif",
+        'theta_v': output_dir / f"{flight_line}_theta_v_eff.tif",
+        'bd':     output_dir / f"{flight_line}_band_depth.tif",
+    }
 
-    n_valid = np.sum(final_mask)
-    steps.write(f"[2] Masking: {time.time()-t0:.1f}s | Valid pixels: {n_valid:,} ({100*n_valid/final_mask.size:.1f}%)")
-    steps.update(1)
+    # Accumulators for end-of-run summary (weighted by valid pixel count)
+    sum_gs = sum_alb = sum_rf = 0.0
+    n_valid_total = 0
 
-    # [3] Band depth
-    steps.set_description("[3] Band depth")
-    t0 = time.time()
-    band_depths = parallel_band_depth(refl_masked, wavelengths)
-    steps.write(f"[3] Band depth: {time.time()-t0:.1f}s")
-    steps.update(1)
+    mk = lambda p: _create_output_tiff(p, height, width, out_transform, crs)
 
-    # [4] Viewing geometry
-    steps.set_description("[4] Viewing geometry")
-    t0 = time.time()
-    theta_i_eff, theta_v_eff, raa_eff = processor.calculate_local_viewing_geometry(
-        data['solar_zenith'], data['solar_azimuth'],
-        slope, aspect,
-        viewing_zenith=0.0, viewing_azimuth=0.0
-    )
-    steps.write(f"[4] Viewing geometry: {time.time()-t0:.1f}s")
-    steps.update(1)
+    with contextlib.ExitStack() as stack:
+        # Source rasters (read-only, kept open for windowed reads)
+        src_atm  = stack.enter_context(rasterio.open(str(atm_path)))
+        src_eglo = stack.enter_context(rasterio.open(str(eglo_path)))
+        src_slp  = stack.enter_context(rasterio.open(str(slp_path)))
+        src_asp  = stack.enter_context(rasterio.open(str(asp_path)))
 
-    # [5] Grain size
-    steps.set_description("[5] Grain size")
-    t0 = time.time()
-    grain_size = processor.retrieve_grain_size_pixelwise(
-        band_depths, theta_i_eff, theta_v_eff, raa_eff
-    )
-    if isinstance(grain_size, da.Array):
-        grain_size = grain_size.compute()
-    steps.write(f"[5] Grain size: {time.time()-t0:.1f}s")
-    steps.update(1)
+        # Output rasters (write-only, supports windowed writes)
+        dst_gs   = stack.enter_context(mk(gs_path))
+        dst_alb  = stack.enter_context(mk(alb_path))
+        dst_rf   = stack.enter_context(mk(rf_path))
+        if save_diagnostics:
+            dst_diag = {k: stack.enter_context(mk(diag_paths[k])) for k in diag_keys}
 
-    # [6] Anisotropy
-    steps.set_description("[6] Anisotropy")
-    t0 = time.time()
-    anisotropy = processor.calculate_anisotropy_factor_pixelwise(
-        grain_size, theta_i_eff, theta_v_eff, raa_eff
-    )
-    if isinstance(anisotropy, da.Array):
-        anisotropy = anisotropy.compute()
-    if anisotropy.ndim == 3:
-        anisotropy_2d = anisotropy[0]
-    else:
-        anisotropy_2d = anisotropy
-    steps.write(f"[6] Anisotropy: {time.time()-t0:.1f}s")
-    steps.update(1)
+        for r0 in tqdm(range(0, height, chunk_rows), desc="chunks", unit="chunk"):
+            r1      = min(r0 + chunk_rows, height)
+            chunk_h = r1 - r0
 
-    # [7+8] Albedo + Radiative forcing (single chunked pass — avoids 13 GB spectral albedo array)
-    steps.set_description("[7] Albedo+RF")
-    t0 = time.time()
-    broadband_albedo, rf_lap = processor.compute_albedo_rf_chunked(
-        refl_masked, anisotropy, global_flux, grain_size
-    )
-    steps.write(f"[7] Albedo: {time.time()-t0:.1f}s")
-    steps.update(1)
+            # Windows: src_win maps into the original file, out_win into the output
+            src_win = rasterio.windows.Window(col_off, row_off + r0, width, chunk_h)
+            out_win = rasterio.windows.Window(0, r0, width, chunk_h)
 
-    steps.set_description("[8] Radiative forcing")
-    steps.write(f"[8] Radiative forcing: (computed with albedo above)")
-    steps.update(1)
-    steps.close()
-    
-    # Print summary
+            # --- Read one strip ---
+            refl   = src_atm.read(window=src_win).astype(np.float32)  / atm_scale
+            flux   = src_eglo.read(window=src_win).astype(np.float32) / eglo_scale
+            slope  = src_slp.read(1, window=src_win).astype(np.float32)
+            aspect = src_asp.read(1, window=src_win).astype(np.float32)
+
+            # Zero is the ENVI no-data sentinel
+            refl = np.where(refl == 0, np.nan, refl)
+            flux = np.where(flux == 0, np.nan, flux)
+
+            # --- Viewing geometry (pure numpy, fast) ---
+            theta_i_eff, theta_v_eff, raa_eff = \
+                processor.calculate_local_viewing_geometry(
+                    solar_zenith, solar_azimuth, slope, aspect,
+                    viewing_zenith=0.0, viewing_azimuth=0.0)
+
+            # --- Masking ---
+            ndsi = ((refl[idx_600] - refl[idx_1500]) /
+                    (refl[idx_600] + refl[idx_1500] + 1e-10))
+            shadow_ratio = refl[0] / (refl[idx_560] + 1e-10)
+            final_mask = (theta_i_eff <= 85) & (ndsi >= 0.87) & (shadow_ratio <= 1.0)
+
+            refl[:, ~final_mask] = np.nan
+            n_valid = int(np.sum(final_mask))
+
+            # NaN tile used when the entire strip is invalid
+            nan_tile = np.full((1, chunk_h, width), np.nan, dtype=np.float32)
+
+            if n_valid == 0:
+                dst_gs.write(nan_tile,  window=out_win)
+                dst_alb.write(nan_tile, window=out_win)
+                dst_rf.write(nan_tile,  window=out_win)
+                if save_diagnostics:
+                    dst_diag['slope'].write(slope[np.newaxis],          window=out_win)
+                    dst_diag['theta_i'].write(theta_i_eff[np.newaxis],  window=out_win)
+                    dst_diag['theta_v'].write(theta_v_eff[np.newaxis],  window=out_win)
+                    dst_diag['bd'].write(nan_tile,                       window=out_win)
+                continue
+
+            # --- Band depth (Numba-accelerated, internally row-chunked) ---
+            band_depths = parallel_band_depth(refl, wavelengths)
+
+            # --- Grain size ---
+            grain_size = processor.retrieve_grain_size_pixelwise(
+                band_depths, theta_i_eff, theta_v_eff, raa_eff)
+            if isinstance(grain_size, da.Array):
+                grain_size = grain_size.compute()
+
+            # --- Anisotropy (n_wvl × chunk_h × width) ---
+            anisotropy = processor.calculate_anisotropy_factor_pixelwise(
+                grain_size, theta_i_eff, theta_v_eff, raa_eff)
+            if isinstance(anisotropy, da.Array):
+                anisotropy = anisotropy.compute()
+
+            # --- Broadband albedo + RF (inner column-chunked loop, O(chunk) RAM) ---
+            broadband_albedo, rf_lap = processor.compute_albedo_rf_chunked(
+                refl, anisotropy, flux, grain_size)
+
+            # --- Write this strip's results immediately ---
+            dst_gs.write(grain_size[np.newaxis],      window=out_win)
+            dst_alb.write(broadband_albedo[np.newaxis], window=out_win)
+            dst_rf.write(rf_lap[np.newaxis],            window=out_win)
+
+            if save_diagnostics:
+                dst_diag['slope'].write(slope[np.newaxis],         window=out_win)
+                dst_diag['theta_i'].write(theta_i_eff[np.newaxis], window=out_win)
+                dst_diag['theta_v'].write(theta_v_eff[np.newaxis], window=out_win)
+                dst_diag['bd'].write(band_depths[np.newaxis],      window=out_win)
+
+            # Accumulate stats (nansum avoids counting NaN pixels twice)
+            sum_gs  += float(np.nansum(grain_size))
+            sum_alb += float(np.nansum(broadband_albedo))
+            sum_rf  += float(np.nansum(rf_lap))
+            n_valid_total += n_valid
+
+            # Explicitly release the strip — Python GC may not be fast enough
+            del refl, flux, slope, aspect, band_depths, grain_size, anisotropy
+            del broadband_albedo, rf_lap
+
+    # All rasterio files are now closed via ExitStack
     total_time = time.time() - t0_total
     print(f"\n{'='*70}")
     print(f"COMPLETED in {total_time:.1f}s")
-    print(f"Mean GS: {np.nanmean(grain_size):.1f} μm")
-    print(f"Mean Albedo: {np.nanmean(broadband_albedo):.3f}")
-    print(f"Mean RF: {np.nanmean(rf_lap):.2f} W/m²")
+    if n_valid_total > 0:
+        print(f"Mean GS:     {sum_gs  / n_valid_total:.1f} μm")
+        print(f"Mean Albedo: {sum_alb / n_valid_total:.3f}")
+        print(f"Mean RF:     {sum_rf  / n_valid_total:.2f} W/m²")
+    else:
+        print("No valid (snow) pixels found in this flight line.")
     print(f"{'='*70}")
-    
-    # Save outputs
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    output_files = {}
-    
-    processor._save_geotiff(grain_size, output_dir / f"{flight_line}_gs.tif", 
-                           data['transform'], data['crs'])
-    processor._save_geotiff(broadband_albedo, output_dir / f"{flight_line}_albedo.tif", 
-                           data['transform'], data['crs'])
-    processor._save_geotiff(rf_lap, output_dir / f"{flight_line}_rf.tif", 
-                           data['transform'], data['crs'])
-    
+
+    output_files = {
+        'gs':     str(gs_path),
+        'albedo': str(alb_path),
+        'rf':     str(rf_path),
+    }
     if save_diagnostics:
-        print("\nSaving diagnostics...")
-        processor._save_geotiff(slope, output_dir / f"{flight_line}_slope.tif", 
-                               data['transform'], data['crs'])
-        processor._save_geotiff(theta_i_eff, output_dir / f"{flight_line}_theta_i_eff.tif", 
-                               data['transform'], data['crs'])
-        processor._save_geotiff(theta_v_eff, output_dir / f"{flight_line}_theta_v_eff.tif", 
-                               data['transform'], data['crs'])
-        processor._save_geotiff(band_depths, output_dir / f"{flight_line}_band_depth.tif", 
-                               data['transform'], data['crs'])
-    
-    print(f"\nResults saved to {output_dir}/")
+        output_files.update({k: str(diag_paths[k]) for k in diag_keys})
+
+    print(f"Results saved to {output_dir}/")
     return output_files
 
 
@@ -433,13 +511,15 @@ def main():
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--workers', type=int, default=None,
                        help='Number of worker threads')
-    
+    parser.add_argument('--chunk-rows', type=int, default=256,
+                       help='Rows per processing chunk (lower = less RAM, default 256)')
+
     args = parser.parse_args()
-    
+
     subset = None
     if args.subset:
         subset = tuple(map(int, args.subset.split(',')))
-    
+
     process_flight_line(
         data_dir=Path(args.data_dir),
         flight_line=args.flight_line,
@@ -448,7 +528,8 @@ def main():
         wvl_path=Path(args.wvl_path),
         subset=subset,
         save_diagnostics=args.diagnostics,
-        n_workers=args.workers
+        n_workers=args.workers,
+        chunk_rows=args.chunk_rows,
     )
 
 

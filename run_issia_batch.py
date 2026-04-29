@@ -77,8 +77,9 @@ def find_flight_lines(data_dir):
     return flight_lines
 
 
-def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None, 
-                 save_diagnostics=False, continue_on_error=True, n_workers=None):
+def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
+                  save_diagnostics=False, continue_on_error=True, n_workers=None,
+                  chunk_rows=256):
     """
     Process multiple flight lines
     
@@ -161,7 +162,8 @@ def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
                 wvl_path=wvl_path,
                 subset=None,
                 save_diagnostics=save_diagnostics,
-                n_workers=n_workers
+                n_workers=n_workers,
+                chunk_rows=chunk_rows,
             )
             
             elapsed = time.time() - t0
@@ -263,6 +265,8 @@ def main():
                        help='Output directory for mosaics (default: <output-dir>/mosaics)')
     parser.add_argument('--edge-setback', type=int, default=50,
                        help='Pixels to trim from swath edges before mosaic weighting')
+    parser.add_argument('--chunk-rows', type=int, default=256,
+                       help='Rows per processing chunk (lower = less RAM, default 256)')
 
     args = parser.parse_args()
 
@@ -283,7 +287,8 @@ def main():
         flight_lines=flight_lines,
         save_diagnostics=args.diagnostics,
         continue_on_error=args.continue_on_error,
-        n_workers=args.workers
+        n_workers=args.workers,
+        chunk_rows=args.chunk_rows,
     )
 
     if args.mosaic and results and (results['successful'] or results['skipped']):
