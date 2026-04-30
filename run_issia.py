@@ -44,111 +44,108 @@ from issia_processor import ISSIAProcessorOptimized
 if HAS_NUMBA:
     @jit(nopython=True, cache=True)
     def _continuum_removal_single(spec_subset, wl_subset):
-        """Single spectrum continuum removal - Numba compatible"""
+        """Continuum removal using upper convex hull (monotone chain) — matches scipy ConvexHull."""
         n = len(spec_subset)
-        
-        # Check for invalid data
+
         for i in range(n):
             if np.isnan(spec_subset[i]) or spec_subset[i] <= 0:
                 return np.nan
-        
-        # Extended arrays for convex hull
-        v_ext = np.empty(n + 2)
-        v_ext[0] = 0
-        v_ext[1:n+1] = spec_subset
-        v_ext[n+1] = 0
-        
-        x_ext = np.empty(n + 2)
-        x_ext[0] = wl_subset[0] - 1e-10
-        x_ext[1:n+1] = wl_subset
-        x_ext[n+1] = wl_subset[n-1] + 1e-10
-        
-        # Simple upper hull (for reflectance spectra)
-        # Find local maxima as hull vertices
-        hull_idx = []
-        hull_idx.append(0)  # Start point
-        
-        for i in range(1, n):
-            # Check if this is a local maximum or on upper envelope
-            if spec_subset[i] >= spec_subset[i-1]:
-                if i == n-1 or spec_subset[i] >= spec_subset[i+1]:
-                    hull_idx.append(i)
-        
-        hull_idx.append(n-1)  # End point
-        
-        if len(hull_idx) < 2:
-            return np.nan
-        
-        # Linear interpolation for continuum
-        continuum = np.empty(n)
-        hi = 0
+
+        # Extended points: zero anchors at both ends, then spectrum
+        m = n + 2
+        px = np.empty(m)
+        py = np.empty(m)
+        px[0] = wl_subset[0] - 1.0
+        py[0] = 0.0
         for i in range(n):
-            while hi < len(hull_idx) - 1 and hull_idx[hi + 1] < i:
-                hi += 1
-            if hi >= len(hull_idx) - 1:
-                hi = len(hull_idx) - 2
-            
-            i0, i1 = hull_idx[hi], hull_idx[hi + 1]
-            if i1 == i0:
+            px[i + 1] = wl_subset[i]
+            py[i + 1] = spec_subset[i]
+        px[m - 1] = wl_subset[n - 1] + 1.0
+        py[m - 1] = 0.0
+
+        # Upper convex hull via monotone chain (points already sorted by x)
+        hull = np.empty(m, dtype=np.int64)
+        k = 0
+        for i in range(m):
+            while k >= 2:
+                o = hull[k - 2]
+                a = hull[k - 1]
+                cross = (px[a] - px[o]) * (py[i] - py[o]) - (py[a] - py[o]) * (px[i] - px[o])
+                if cross >= 0:
+                    k -= 1
+                else:
+                    break
+            hull[k] = i
+            k += 1
+
+        # Collect hull vertices that are original spec points (not zero anchors)
+        spec_hull = np.empty(k, dtype=np.int64)
+        nh = 0
+        for j in range(k):
+            h = hull[j]
+            if 1 <= h <= n:
+                spec_hull[nh] = h - 1
+                nh += 1
+
+        if nh < 1:
+            return np.nan
+
+        # Piecewise-linear continuum through hull vertices
+        continuum = np.empty(n)
+        seg = 0
+        for i in range(n):
+            while seg < nh - 2 and spec_hull[seg + 1] <= i:
+                seg += 1
+            i0 = spec_hull[seg]
+            i1 = spec_hull[min(seg + 1, nh - 1)]
+            if i0 == i1 or i <= i0:
                 continuum[i] = spec_subset[i0]
+            elif i >= i1:
+                continuum[i] = spec_subset[i1]
             else:
-                t = (i - i0) / (i1 - i0)
+                t = float(i - i0) / float(i1 - i0)
                 continuum[i] = spec_subset[i0] + t * (spec_subset[i1] - spec_subset[i0])
-        
-        # Ensure positive continuum
+
         for i in range(n):
             if continuum[i] < 1e-10:
                 continuum[i] = 1e-10
-        
-        # Find minimum of ratio
+
         min_ratio = spec_subset[0] / continuum[0]
         for i in range(1, n):
-            ratio = spec_subset[i] / continuum[i]
-            if ratio < min_ratio:
-                min_ratio = ratio
-        
-        return 1.0 - min_ratio
+            r = spec_subset[i] / continuum[i]
+            if r < min_ratio:
+                min_ratio = r
+
+        band_depth = 1.0 - min_ratio
+        if band_depth < 0.0:
+            band_depth = 0.0
+        return band_depth
 
     @jit(nopython=True, parallel=True, cache=True)
     def _parallel_band_depth_numba(spec_block, wavelengths, left_idx, right_idx):
         """Numba-parallelized band depth calculation"""
         n_bands, rows, cols = spec_block.shape
         result = np.full((rows, cols), np.nan, dtype=np.float32)
-        
+
         wl_subset = wavelengths[left_idx:right_idx+1].astype(np.float32)
         n_subset = right_idx - left_idx + 1
-        
+
         for i in prange(rows):
             for j in range(cols):
-                # Extract and smooth spectrum subset
                 spec_subset = np.empty(n_subset, dtype=np.float32)
                 for k in range(n_subset):
                     val = spec_block[left_idx + k, i, j]
                     if np.isnan(val):
                         val = 0.0
                     spec_subset[k] = val
-                
-                # Simple smoothing (moving average instead of Savgol for Numba)
-                smoothed = np.empty(n_subset, dtype=np.float32)
-                window = 5  # Half window
-                for k in range(n_subset):
-                    start = max(0, k - window)
-                    end = min(n_subset, k + window + 1)
-                    total = 0.0
-                    count = 0
-                    for m in range(start, end):
-                        total += spec_subset[m]
-                        count += 1
-                    smoothed[k] = total / count
-                
-                result[i, j] = _continuum_removal_single(smoothed, wl_subset)
-        
+                result[i, j] = _continuum_removal_single(spec_subset, wl_subset)
+
         return result
 
 
 def continuum_removal_830_1130(spectrum, wavelengths):
     """Calculate continuum-removed band depth (fallback)"""
-    left_wl, right_wl = 900.0, 1130.0
+    left_wl, right_wl = 830.0, 1130.0
     left_idx = np.argmin(np.abs(wavelengths - left_wl))
     right_idx = np.argmin(np.abs(wavelengths - right_wl))
     spec_subset = spectrum[left_idx:right_idx+1]
@@ -165,11 +162,10 @@ def continuum_removal_830_1130(spectrum, wavelengths):
     try:
         hull = ConvexHull(points)
         K = hull.vertices
-        K = np.delete(K, [0, 1])
-        K = np.delete(K, -1)
+        K = K[(K > 0) & (K <= n)]
         K = np.sort(K) - 1
-        
-        if len(K) < 2 or np.max(K) >= n:
+
+        if len(K) < 2:
             return np.nan
         
         continuum = np.interp(np.arange(n), K, spec_subset[K])
@@ -197,14 +193,13 @@ def _init_bd_worker(shm_name, out_name, shape, wvl):
 def _process_bd_row(i):
     for j in range(_spec.shape[2]):
         spectrum = np.nan_to_num(_spec[:, i, j], nan=0.0)
-        smoothed = savgol_filter(spectrum, 11, 3, mode='nearest')
-        _output[i, j] = continuum_removal_830_1130(smoothed, _wvl)
+        _output[i, j] = continuum_removal_830_1130(spectrum, _wvl)
     return i
 
 def parallel_band_depth(spec_block, wavelengths, chunk_rows=256):
     """Calculate band depth - uses Numba JIT if available, else shared memory fallback"""
     if HAS_NUMBA:
-        left_idx = np.argmin(np.abs(wavelengths - 900.0))
+        left_idx = np.argmin(np.abs(wavelengths - 830.0))
         right_idx = np.argmin(np.abs(wavelengths - 1130.0))
         spec_f32 = spec_block.astype(np.float32)
         wl_f32 = wavelengths.astype(np.float32)
@@ -444,6 +439,11 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             slope  = src_slp.read(1, window=src_win).astype(np.float32)
             aspect = src_asp.read(1, window=src_win).astype(np.float32)
             if _first_chunk: print(f"  [t] read:     {time.time()-_t:.2f}s"); _t = time.time()
+
+            # Spectral smoothing: match MATLAB smoothdata(cube,3,'sgolay',10) applied
+            # before NDSI and band depth computation.  Window=11, polyorder=3 is a
+            # practical approximation; MATLAB's auto window for 451 bands is ~11.
+            refl = savgol_filter(refl, window_length=11, polyorder=3, axis=0, mode='nearest')
 
             # Mask nodata: zero is the ENVI sentinel; also honour rasterio's nodata value
             refl = np.where(refl == 0, np.nan, refl)

@@ -504,20 +504,33 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
         broadband = np.full((rows, cols), np.nan, dtype=np.float32)
         rf = np.full((rows, cols), np.nan, dtype=np.float32)
 
-        den_full = np.trapezoid(flux, x=wvl_um, axis=0)  # (rows, cols) — flux denominator
+        # NaN→0 on flux so that absorption-window zero bands don't kill den_full.
+        # Matches MATLAB which keeps zeros rather than NaN-masking them.
+        flux_int = np.where(np.isnan(flux), 0.0, flux)
+        den_full = np.trapezoid(flux_int, x=wvl_um, axis=0)  # (rows, cols) — flux denominator
 
         with tqdm(total=cols, desc="    albedo+RF", unit="col", leave=False) as pbar:
             for c0 in range(0, cols, chunk_cols):
                 c1 = min(c0 + chunk_cols, cols)
 
                 sa = refl[:, :, c0:c1] * aniso[:, :, c0:c1]
-                fx = flux[:, :, c0:c1]
+                fx = flux_int[:, :, c0:c1]
 
-                # Broadband albedo
-                num = np.trapezoid(sa * fx, x=wvl_um, axis=0)
+                # Replace NaN with 0 before integration — matches MATLAB which keeps
+                # zeros in the trapz rather than propagating NaN from SWIR absorption
+                # windows through to the broadband integral.
+                sa_int = np.where(np.isnan(sa), 0.0, sa)
+
+                # Broadband albedo — only valid where grain size was retrieved
+                num = np.trapezoid(sa_int * fx, x=wvl_um, axis=0)
                 den = den_full[:, c0:c1]
+                gs_slice = gs[:, c0:c1]
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    broadband[:, c0:c1] = np.where(den > 0, (num / den).astype(np.float32), np.nan)
+                    broadband[:, c0:c1] = np.where(
+                        np.isfinite(gs_slice) & (den > 0),
+                        (num / den).astype(np.float32),
+                        np.nan
+                    )
 
                 # Radiative forcing
                 if HAS_NUMBA:
