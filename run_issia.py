@@ -293,8 +293,19 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
 
     print("=" * 70)
     print(f"ISSIA CHUNKED PROCESSING  |  flight line: {flight_line}")
+    if HAS_NUMBA:
+        import numba
+        numba_threads = numba.get_num_threads()
+        try:
+            from numba import threading_layer
+            tl = threading_layer()
+        except Exception:
+            tl = "unknown"
+    else:
+        numba_threads, tl = 0, "n/a"
     print(f"Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED'}  |  "
-          f"cores: {os.cpu_count()}  |  chunk_rows: {chunk_rows}")
+          f"cores: {os.cpu_count()}  |  numba_threads: {numba_threads}  |  "
+          f"threading_layer: {tl}  |  chunk_rows: {chunk_rows}")
     print("=" * 70)
 
     wavelengths = np.load(wvl_path)
