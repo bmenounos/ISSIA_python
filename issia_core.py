@@ -467,8 +467,8 @@ class ISSIAProcessor:
             Broadband albedo (rows, cols)
         """
         wvl_um = self.wavelengths / 1000.0
-        numerator = np.trapz(spectral_albedo * global_flux, x=wvl_um, axis=0)
-        denominator = np.trapz(global_flux, x=wvl_um, axis=0)
+        numerator = np.trapezoid(spectral_albedo * global_flux, x=wvl_um, axis=0)
+        denominator = np.trapezoid(global_flux, x=wvl_um, axis=0)
         return numerator / denominator
     
     def calculate_radiative_forcing(self,

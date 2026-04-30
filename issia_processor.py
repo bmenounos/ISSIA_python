@@ -474,7 +474,7 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
                     albedo_clean = self.albedo_lut[gs_idx, rf_mask]
                     rf_diff = np.maximum(albedo_clean - spec[rf_mask, i, j], 0)
                     ## convert flux from nm to micron
-                    result[i, j] = np.trapz(rf_diff * (flux[rf_mask, i, j] * 1000.0), wvl_um[rf_mask])
+                    result[i, j] = np.trapezoid(rf_diff * (flux[rf_mask, i, j] * 1000.0), wvl_um[rf_mask])
         
         return da.from_array(result, chunks=self.chunk_size)
 
@@ -504,7 +504,7 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
         broadband = np.full((rows, cols), np.nan, dtype=np.float32)
         rf = np.full((rows, cols), np.nan, dtype=np.float32)
 
-        den_full = np.trapz(flux, x=wvl_um, axis=0)  # (rows, cols) — flux denominator
+        den_full = np.trapezoid(flux, x=wvl_um, axis=0)  # (rows, cols) — flux denominator
 
         with tqdm(total=cols, desc="    albedo+RF", unit="col", leave=False) as pbar:
             for c0 in range(0, cols, chunk_cols):
@@ -514,7 +514,7 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
                 fx = flux[:, :, c0:c1]
 
                 # Broadband albedo
-                num = np.trapz(sa * fx, x=wvl_um, axis=0)
+                num = np.trapezoid(sa * fx, x=wvl_um, axis=0)
                 den = den_full[:, c0:c1]
                 with np.errstate(divide='ignore', invalid='ignore'):
                     broadband[:, c0:c1] = np.where(den > 0, (num / den).astype(np.float32), np.nan)
@@ -535,7 +535,7 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
                             gs_idx = np.argmin(np.abs(self._grain_radii_f32 - g))
                             clean = self.albedo_lut[gs_idx, rf_mask]
                             diff = np.maximum(0.0, clean - sa[rf_mask, i, j])
-                            rf[i, c0 + j] = np.trapz(diff * fx[rf_mask, i, j] * 1000.0,
+                            rf[i, c0 + j] = np.trapezoid(diff * fx[rf_mask, i, j] * 1000.0,
                                                       wvl_um[rf_mask])
 
                 pbar.update(c1 - c0)
