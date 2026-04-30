@@ -367,11 +367,14 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
     atm_scale  = _read_hdr_scale_factor(atm_path)
     eglo_scale = _read_hdr_scale_factor(eglo_path)
     solar_zenith, solar_azimuth = processor._read_solar_zenith(inn_path)
+    print(f"[1] Solar angles  |  zenith: {solar_zenith:.2f}°  |  azimuth: {solar_azimuth:.2f}°")
 
     # Band indices computed once
     idx_600  = int(np.argmin(np.abs(wavelengths - 600)))
     idx_1500 = int(np.argmin(np.abs(wavelengths - 1500)))
     idx_560  = int(np.argmin(np.abs(wavelengths - 560)))
+    print(f"[1] Band indices  |  560nm→{idx_560}  600nm→{idx_600}  1500nm→{idx_1500}  "
+          f"(wvl range {wavelengths[0]:.0f}–{wavelengths[-1]:.0f} nm, {len(wavelengths)} bands)")
 
     # Raster geometry
     with rasterio.open(str(atm_path)) as src:
