@@ -466,7 +466,12 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             if _first_chunk:
                 n_px = chunk_h * width
                 print(f"  [t] masking:  {time.time()-_t:.2f}s  ({n_valid} valid px)")
-                print(f"  [m] zenith ok:  {int(np.sum(theta_i_eff <= solar_zenith_max))}/{n_px}")
+                print(f"  [m] zenith ok:  {int(np.sum(theta_i_eff <= solar_zenith_max))}/{n_px}  "
+                      f"(theta_i_eff range {float(np.nanmin(theta_i_eff)):.1f}–{float(np.nanmax(theta_i_eff)):.1f}°)")
+                print(f"  [m] slope range: {float(np.nanmin(slope)):.1f}–{float(np.nanmax(slope)):.1f}°  "
+                      f"atm_scale={atm_scale}  n_bands={refl.shape[0]}")
+                print(f"  [m] refl[{idx_600}] range: {float(np.nanmin(refl[idx_600])):.4f}–{float(np.nanmax(refl[idx_600])):.4f}  "
+                      f"refl[{idx_1500}] range: {float(np.nanmin(refl[idx_1500])):.4f}–{float(np.nanmax(refl[idx_1500])):.4f}")
                 print(f"  [m] ndsi ok:    {int(np.sum(ndsi >= ndsi_threshold))}/{n_px}  "
                       f"(ndsi range {float(np.nanmin(ndsi)):.3f}–{float(np.nanmax(ndsi)):.3f})")
                 print(f"  [m] shadow ok:  {int(np.sum(shadow_ratio <= shadow_ratio_threshold))}/{n_px}")
