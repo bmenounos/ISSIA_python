@@ -40,12 +40,16 @@ for suffix in ['_slp.dat', '_atm.dat', '_eglo.dat', '_asp.dat']:
             if suffix == '_atm.dat' and src.count >= max(idx_600, idx_1500) + 1:
                 for label, idx in [('560nm', idx_560), ('600nm', idx_600), ('1500nm', idx_1500)]:
                     band = src.read(idx + 1).astype(np.float32)  # rasterio bands are 1-indexed
-                    n_zero = int(np.sum(band == 0))
-                    n_nd   = int(np.sum(band == nd)) if nd is not None else 0
-                    n_valid_band = band.size - n_zero - n_nd
+                    good = (band > 0) & (band != nd if nd is not None else True)
+                    n_valid_band = int(np.sum(good))
+                    vrange = (f"{float(band[good].min()):.0f}–{float(band[good].max()):.0f}"
+                              if n_valid_band else "N/A")
                     print(f"  band {idx} ({label}): {n_valid_band}/{band.size} non-zero non-nodata  "
-                          f"range={float(band[band > 0].min()) if n_valid_band else 'N/A':.0f}–"
-                          f"{float(band.max()):.0f}")
+                          f"range={vrange}")
+                    if n_valid_band:
+                        brows = np.where(good.any(axis=1))[0]
+                        bcols = np.where(good.any(axis=0))[0]
+                        print(f"    valid rows: {brows[0]}–{brows[-1]}  cols: {bcols[0]}–{bcols[-1]}")
 
             stats[suffix] = valid_mask
     except Exception as e:
