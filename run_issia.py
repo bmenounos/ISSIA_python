@@ -428,6 +428,7 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             dst_diag = {k: stack.enter_context(mk(diag_paths[k])) for k in diag_keys}
 
         _first_chunk = True
+        _diag_done = False  # print mask diagnostics once for first chunk with valid slope
         for r0 in tqdm(range(0, height, chunk_rows), desc="chunks", unit="chunk"):
             r1      = min(r0 + chunk_rows, height)
             chunk_h = r1 - r0
@@ -471,19 +472,24 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
 
             refl[:, ~final_mask] = np.nan
             n_valid = int(np.sum(final_mask))
-            if _first_chunk:
+
+            # Print mask diagnostics for the first chunk that has valid slope data
+            has_valid_slope = not np.all(np.isnan(slope))
+            if not _diag_done and has_valid_slope:
+                _diag_done = True
                 n_px = chunk_h * width
-                print(f"  [t] masking:  {time.time()-_t:.2f}s  ({n_valid} valid px)")
+                print(f"  [chunk r{r0}] {n_valid} valid px / {n_px}")
                 print(f"  [m] zenith ok:  {int(np.sum(theta_i_eff <= solar_zenith_max))}/{n_px}  "
-                      f"(theta_i_eff range {float(np.nanmin(theta_i_eff)):.1f}–{float(np.nanmax(theta_i_eff)):.1f}°)")
-                print(f"  [m] slope range: {float(np.nanmin(slope)):.1f}–{float(np.nanmax(slope)):.1f}°  "
-                      f"atm_scale={atm_scale}  n_bands={refl.shape[0]}")
-                print(f"  [m] refl[{idx_600}] range: {float(np.nanmin(refl[idx_600])):.4f}–{float(np.nanmax(refl[idx_600])):.4f}  "
-                      f"refl[{idx_1500}] range: {float(np.nanmin(refl[idx_1500])):.4f}–{float(np.nanmax(refl[idx_1500])):.4f}")
+                      f"(theta_i_eff {float(np.nanmin(theta_i_eff)):.1f}–{float(np.nanmax(theta_i_eff)):.1f}°)")
+                print(f"  [m] slope:      {float(np.nanmin(slope)):.1f}–{float(np.nanmax(slope)):.1f}°  "
+                      f"n_bands={refl.shape[0]}")
+                print(f"  [m] refl[{idx_600}]: {float(np.nanmin(refl[idx_600])):.4f}–{float(np.nanmax(refl[idx_600])):.4f}  "
+                      f"refl[{idx_1500}]: {float(np.nanmin(refl[idx_1500])):.4f}–{float(np.nanmax(refl[idx_1500])):.4f}")
                 print(f"  [m] ndsi ok:    {int(np.sum(ndsi >= ndsi_threshold))}/{n_px}  "
-                      f"(ndsi range {float(np.nanmin(ndsi)):.3f}–{float(np.nanmax(ndsi)):.3f})")
+                      f"({float(np.nanmin(ndsi)):.3f}–{float(np.nanmax(ndsi)):.3f})")
                 print(f"  [m] shadow ok:  {int(np.sum(shadow_ratio <= shadow_ratio_threshold))}/{n_px}")
-                _t = time.time()
+            if _first_chunk:
+                print(f"  [t] masking:  {time.time()-_t:.2f}s"); _t = time.time()
 
             # NaN tile used when the entire strip is invalid
             nan_tile = np.full((1, chunk_h, width), np.nan, dtype=np.float32)
