@@ -444,9 +444,17 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             aspect = src_asp.read(1, window=src_win).astype(np.float32)
             if _first_chunk: print(f"  [t] read:     {time.time()-_t:.2f}s"); _t = time.time()
 
-            # Zero is the ENVI no-data sentinel
+            # Mask nodata: zero is the ENVI sentinel; also honour rasterio's nodata value
             refl = np.where(refl == 0, np.nan, refl)
             flux = np.where(flux == 0, np.nan, flux)
+            if src_atm.nodata is not None:
+                refl[refl == np.float32(src_atm.nodata) / atm_scale] = np.nan
+            if src_eglo.nodata is not None:
+                flux[flux == np.float32(src_eglo.nodata) / eglo_scale] = np.nan
+            if src_slp.nodata is not None:
+                slope[slope == np.float32(src_slp.nodata)] = np.nan
+            if src_asp.nodata is not None:
+                aspect[aspect == np.float32(src_asp.nodata)] = np.nan
 
             # --- Viewing geometry (pure numpy, fast) ---
             theta_i_eff, theta_v_eff, raa_eff = \
