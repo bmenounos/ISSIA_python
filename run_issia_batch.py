@@ -26,7 +26,7 @@ import warnings
 from datetime import datetime
 import traceback
 
-from run_issia import process_flight_line
+from run_issia import process_flight_line, load_config
 
 # Check for Numba
 try:
@@ -79,7 +79,8 @@ def find_flight_lines(data_dir):
 
 def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
                   save_diagnostics=False, continue_on_error=True, n_workers=None,
-                  chunk_rows=256):
+                  chunk_rows=256, ndsi_threshold=0.87,
+                  shadow_ratio_threshold=1.0, solar_zenith_max=85.0):
     """
     Process multiple flight lines
     
@@ -164,6 +165,9 @@ def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
                 save_diagnostics=save_diagnostics,
                 n_workers=n_workers,
                 chunk_rows=chunk_rows,
+                ndsi_threshold=ndsi_threshold,
+                shadow_ratio_threshold=shadow_ratio_threshold,
+                solar_zenith_max=solar_zenith_max,
             )
             
             elapsed = time.time() - t0
@@ -237,6 +241,8 @@ def batch_process(data_dir, output_dir, lut_dir, wvl_path, flight_lines=None,
 
 
 def main():
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description='ISSIA - Batch process multiple flight lines',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -249,6 +255,8 @@ def main():
                        help='Directory containing lookup tables')
     parser.add_argument('--wvl-path', type=str, default='wvl.npy',
                        help='Path to wavelength file')
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to issia_config.json (default: ./issia_config.json)')
     parser.add_argument('--flight-lines', type=str, nargs='+', default=None,
                        help='Specific flight line IDs to process')
     parser.add_argument('--flight-list', type=str, default=None,
@@ -265,14 +273,22 @@ def main():
                        help='Output directory for mosaics (default: <output-dir>/mosaics)')
     parser.add_argument('--edge-setback', type=int, default=50,
                        help='Pixels to trim from swath edges before mosaic weighting')
-    parser.add_argument('--chunk-rows', type=int, default=256,
-                       help='Rows per processing chunk (lower = less RAM, default 256)')
+    parser.add_argument('--chunk-rows', type=int, default=None,
+                       help='Rows per processing chunk (overrides config, default 256)')
+    parser.add_argument('--ndsi-threshold', type=float, default=None,
+                       help='Minimum NDSI to include pixel (overrides config, default 0.87)')
+    parser.add_argument('--shadow-ratio-threshold', type=float, default=None,
+                       help='Maximum shadow ratio to include pixel (overrides config, default 1.0)')
+    parser.add_argument('--solar-zenith-max', type=float, default=None,
+                       help='Maximum solar zenith angle in degrees (overrides config, default 85)')
 
     args = parser.parse_args()
 
+    if args.config:
+        cfg = load_config(args.config)
+
     # Determine flight lines to process
     flight_lines = None
-
     if args.flight_lines:
         flight_lines = args.flight_lines
     elif args.flight_list:
@@ -288,7 +304,10 @@ def main():
         save_diagnostics=args.diagnostics,
         continue_on_error=args.continue_on_error,
         n_workers=args.workers,
-        chunk_rows=args.chunk_rows,
+        chunk_rows=args.chunk_rows                     if args.chunk_rows             is not None else cfg['chunk_rows'],
+        ndsi_threshold=args.ndsi_threshold             if args.ndsi_threshold         is not None else cfg['ndsi_threshold'],
+        shadow_ratio_threshold=args.shadow_ratio_threshold if args.shadow_ratio_threshold is not None else cfg['shadow_ratio_threshold'],
+        solar_zenith_max=args.solar_zenith_max         if args.solar_zenith_max       is not None else cfg['solar_zenith_max'],
     )
 
     if args.mosaic and results and (results['successful'] or results['skipped']):

@@ -12,6 +12,7 @@ Usage:
 """
 
 import contextlib
+import json
 import numpy as np
 import rasterio
 import argparse
@@ -274,9 +275,33 @@ def _create_output_tiff(path, height, width, transform, crs):
     )
 
 
+_CONFIG_DEFAULTS = {
+    "ndsi_threshold":         0.87,
+    "shadow_ratio_threshold": 1.0,
+    "solar_zenith_max":       85.0,
+    "chunk_rows":             256,
+}
+
+def load_config(path=None):
+    """Load issia_config.json, returning merged defaults + file values.
+
+    Search order: explicit path → ./issia_config.json → defaults only.
+    """
+    cfg = dict(_CONFIG_DEFAULTS)
+    candidates = [Path(path)] if path else [Path("issia_config.json")]
+    for p in candidates:
+        if p.exists():
+            with open(p) as f:
+                cfg.update(json.load(f))
+            print(f"Config loaded from {p}")
+            break
+    return cfg
+
+
 def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                         subset=None, save_diagnostics=False, n_workers=None,
-                        chunk_rows=256):
+                        chunk_rows=256, ndsi_threshold=0.87,
+                        shadow_ratio_threshold=1.0, solar_zenith_max=85.0):
     """
     Process a single flight line with constant peak-memory chunked I/O.
 
@@ -306,6 +331,9 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
     print(f"Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED'}  |  "
           f"cores: {os.cpu_count()}  |  numba_threads: {numba_threads}  |  "
           f"threading_layer: {tl}  |  chunk_rows: {chunk_rows}")
+    print(f"Thresholds  |  NDSI >= {ndsi_threshold}  |  "
+          f"shadow_ratio <= {shadow_ratio_threshold}  |  "
+          f"solar_zenith_max: {solar_zenith_max}")
     print("=" * 70)
 
     wavelengths = np.load(wvl_path)
@@ -424,7 +452,7 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             ndsi = ((refl[idx_600] - refl[idx_1500]) /
                     (refl[idx_600] + refl[idx_1500] + 1e-10))
             shadow_ratio = refl[0] / (refl[idx_560] + 1e-10)
-            final_mask = (theta_i_eff <= 85) & (ndsi >= 0.87) & (shadow_ratio <= 1.0)
+            final_mask = (theta_i_eff <= solar_zenith_max) & (ndsi >= ndsi_threshold) & (shadow_ratio <= shadow_ratio_threshold)
 
             refl[:, ~final_mask] = np.nan
             n_valid = int(np.sum(final_mask))
@@ -508,6 +536,8 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
 
 
 def main():
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description='ISSIA Optimized Processing',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -517,15 +547,26 @@ def main():
     parser.add_argument('--output-dir', type=str, required=True)
     parser.add_argument('--lut-dir', type=str, default='luts')
     parser.add_argument('--wvl-path', type=str, default='wvl.npy')
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to issia_config.json (default: ./issia_config.json)')
     parser.add_argument('--subset', type=str, default=None,
                        help='Spatial subset as "ymin,ymax,xmin,xmax"')
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--workers', type=int, default=None,
                        help='Number of worker threads')
-    parser.add_argument('--chunk-rows', type=int, default=256,
-                       help='Rows per processing chunk (lower = less RAM, default 256)')
+    parser.add_argument('--chunk-rows', type=int, default=None,
+                       help='Rows per processing chunk (overrides config, default 256)')
+    parser.add_argument('--ndsi-threshold', type=float, default=None,
+                       help='Minimum NDSI to include pixel (overrides config, default 0.87)')
+    parser.add_argument('--shadow-ratio-threshold', type=float, default=None,
+                       help='Maximum shadow ratio to include pixel (overrides config, default 1.0)')
+    parser.add_argument('--solar-zenith-max', type=float, default=None,
+                       help='Maximum solar zenith angle in degrees (overrides config, default 85)')
 
     args = parser.parse_args()
+
+    if args.config:
+        cfg = load_config(args.config)
 
     subset = None
     if args.subset:
@@ -540,7 +581,10 @@ def main():
         subset=subset,
         save_diagnostics=args.diagnostics,
         n_workers=args.workers,
-        chunk_rows=args.chunk_rows,
+        chunk_rows=args.chunk_rows             if args.chunk_rows             is not None else cfg['chunk_rows'],
+        ndsi_threshold=args.ndsi_threshold     if args.ndsi_threshold         is not None else cfg['ndsi_threshold'],
+        shadow_ratio_threshold=args.shadow_ratio_threshold if args.shadow_ratio_threshold is not None else cfg['shadow_ratio_threshold'],
+        solar_zenith_max=args.solar_zenith_max if args.solar_zenith_max       is not None else cfg['solar_zenith_max'],
     )
 
 

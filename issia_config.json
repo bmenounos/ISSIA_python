@@ -1,0 +1,15 @@
+{
+    "_comment": "Copy this file into your survey data directory and adjust thresholds as needed.",
+
+    "ndsi_threshold": 0.87,
+    "_ndsi_threshold_note": "Min NDSI to accept a pixel. 0.87=clean snow, 0.4=dirty/glacial ice.",
+
+    "shadow_ratio_threshold": 1.0,
+    "_shadow_ratio_threshold_note": "Max ratio of first band to 560nm band. Increase to include more shadow pixels.",
+
+    "solar_zenith_max": 85.0,
+    "_solar_zenith_max_note": "Max effective solar zenith angle (degrees). Reduce to exclude very oblique illumination.",
+
+    "chunk_rows": 256,
+    "_chunk_rows_note": "Rows per processing chunk. Increase for more RAM (faster), decrease for less RAM."
+}
