@@ -424,9 +424,11 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
         if save_diagnostics:
             dst_diag = {k: stack.enter_context(mk(diag_paths[k])) for k in diag_keys}
 
+        _first_chunk = True
         for r0 in tqdm(range(0, height, chunk_rows), desc="chunks", unit="chunk"):
             r1      = min(r0 + chunk_rows, height)
             chunk_h = r1 - r0
+            _t = time.time() if _first_chunk else None
 
             # Windows: src_win maps into the original file, out_win into the output
             src_win = rasterio.windows.Window(col_off, row_off + r0, width, chunk_h)
@@ -437,6 +439,7 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             flux   = src_eglo.read(window=src_win).astype(np.float32) / eglo_scale
             slope  = src_slp.read(1, window=src_win).astype(np.float32)
             aspect = src_asp.read(1, window=src_win).astype(np.float32)
+            if _first_chunk: print(f"  [t] read:     {time.time()-_t:.2f}s"); _t = time.time()
 
             # Zero is the ENVI no-data sentinel
             refl = np.where(refl == 0, np.nan, refl)
@@ -447,6 +450,7 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                 processor.calculate_local_viewing_geometry(
                     solar_zenith, solar_azimuth, slope, aspect,
                     viewing_zenith=0.0, viewing_azimuth=0.0)
+            if _first_chunk: print(f"  [t] geometry: {time.time()-_t:.2f}s"); _t = time.time()
 
             # --- Masking ---
             ndsi = ((refl[idx_600] - refl[idx_1500]) /
@@ -456,6 +460,7 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
 
             refl[:, ~final_mask] = np.nan
             n_valid = int(np.sum(final_mask))
+            if _first_chunk: print(f"  [t] masking:  {time.time()-_t:.2f}s  ({n_valid} valid px)"); _t = time.time()
 
             # NaN tile used when the entire strip is invalid
             nan_tile = np.full((1, chunk_h, width), np.nan, dtype=np.float32)
@@ -469,22 +474,26 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                     dst_diag['theta_i'].write(theta_i_eff[np.newaxis],  window=out_win)
                     dst_diag['theta_v'].write(theta_v_eff[np.newaxis],  window=out_win)
                     dst_diag['bd'].write(nan_tile,                       window=out_win)
+                _first_chunk = False
                 continue
 
             # --- Band depth (Numba-accelerated, internally row-chunked) ---
             band_depths = parallel_band_depth(refl, wavelengths)
+            if _first_chunk: print(f"  [t] band_depth:{time.time()-_t:.2f}s"); _t = time.time()
 
             # --- Grain size ---
             grain_size = processor.retrieve_grain_size_pixelwise(
                 band_depths, theta_i_eff, theta_v_eff, raa_eff)
             if isinstance(grain_size, da.Array):
                 grain_size = grain_size.compute()
+            if _first_chunk: print(f"  [t] grain_size:{time.time()-_t:.2f}s"); _t = time.time()
 
             # --- Anisotropy (n_wvl × chunk_h × width) ---
             anisotropy = processor.calculate_anisotropy_factor_pixelwise(
                 grain_size, theta_i_eff, theta_v_eff, raa_eff)
             if isinstance(anisotropy, da.Array):
                 anisotropy = anisotropy.compute()
+            if _first_chunk: print(f"  [t] anisotropy:{time.time()-_t:.2f}s"); _t = time.time()
 
             # --- Broadband albedo + RF (inner column-chunked loop, O(chunk) RAM) ---
             broadband_albedo, rf_lap = processor.compute_albedo_rf_chunked(
@@ -506,6 +515,9 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             sum_alb += float(np.nansum(broadband_albedo))
             sum_rf  += float(np.nansum(rf_lap))
             n_valid_total += n_valid
+
+            if _first_chunk: print(f"  [t] write+misc:{time.time()-_t:.2f}s")
+            _first_chunk = False
 
             # Explicitly release the strip — Python GC may not be fast enough
             del refl, flux, slope, aspect, band_depths, grain_size, anisotropy
