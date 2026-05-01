@@ -93,13 +93,12 @@ as an approximation. If pixel counts still don't match, try adjusting window_len
 
 ## Next Steps
 1. ✅ All three products now output 128,335 valid pixels (grain size = albedo = RF)
-2. Remaining 16K pixel gap to MATLAB (144,806) — possible causes to investigate:
-   a. **Savgol mismatch**: MATLAB uses `smoothdata(...,'sgolay',10)` (polyorder=10, auto window).
-      Python uses `window=11, polyorder=3`. Try `polyorder=5` or `window=21`.
-   b. **Zero-masking before vs after smoothing**: smoothing order relative to nodata mask may differ
-   c. **Shadow filter edge**: MATLAB `shadow_b1=1` → first non-zero band? Check if Python uses idx 0 vs 1
-3. To commit: `git commit -am "Fix ISSIA regressions: hull, NDSI, savgol, albedo NaN propagation"`
-4. Do NOT `git push` until pixel count gap is resolved or accepted
+2. Remaining 16K pixel gap to MATLAB (144,806) — two further fixes applied (2026-05-01):
+   a. ✅ **Savgol polyorder fixed**: `polyorder=3` → `polyorder=10` (matches MATLAB `sgolay,10`; auto window = `2*ceil(10/2)+1 = 11`)
+   b. ✅ **Mask-before-smooth**: nodata zeros now converted to NaN *before* savgol, NaN mask restored after. Matches MATLAB's NaN-aware smoothdata.
+   c. **Shadow filter edge**: MATLAB `shadow_b1=1` → first non-zero band? Check if Python uses idx 0 vs 1 (still open)
+3. Re-run on 19-52-46 flight line to see if pixel count moves from 128,335 → 144,806
+4. To commit once pixel count is verified
 5. To use 0.4 threshold for glacial ice: `python run_issia.py ... --ndsi-threshold 0.4`
 
 ---

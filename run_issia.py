@@ -440,12 +440,9 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             aspect = src_asp.read(1, window=src_win).astype(np.float32)
             if _first_chunk: print(f"  [t] read:     {time.time()-_t:.2f}s"); _t = time.time()
 
-            # Spectral smoothing: match MATLAB smoothdata(cube,3,'sgolay',10) applied
-            # before NDSI and band depth computation.  Window=11, polyorder=3 is a
-            # practical approximation; MATLAB's auto window for 451 bands is ~11.
-            refl = savgol_filter(refl, window_length=11, polyorder=3, axis=0, mode='nearest')
-
-            # Mask nodata: zero is the ENVI sentinel; also honour rasterio's nodata value
+            # Mask nodata first (before smoothing) so zeros don't contaminate
+            # adjacent bands in the savgol window — matches MATLAB's NaN-aware
+            # smoothdata which skips nodata samples.
             refl = np.where(refl == 0, np.nan, refl)
             flux = np.where(flux == 0, np.nan, flux)
             if src_atm.nodata is not None:
@@ -456,6 +453,15 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                 slope[slope == np.float32(src_slp.nodata)] = np.nan
             if src_asp.nodata is not None:
                 aspect[aspect == np.float32(src_asp.nodata)] = np.nan
+
+            # Spectral smoothing: match MATLAB smoothdata(cube,3,'sgolay',10).
+            # polyorder=10, window=11 (MATLAB auto: 2*ceil(10/2)+1=11).
+            # savgol_filter doesn't support NaN; fill masked values with 0,
+            # smooth, then restore the NaN mask.
+            _refl_nan = np.isnan(refl)
+            refl = savgol_filter(np.where(_refl_nan, 0.0, refl),
+                                 window_length=11, polyorder=10, axis=0, mode='nearest')
+            refl[_refl_nan] = np.nan
 
             # --- Viewing geometry (pure numpy, fast) ---
             theta_i_eff, theta_v_eff, raa_eff = \
