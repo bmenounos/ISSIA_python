@@ -455,12 +455,14 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                 aspect[aspect == np.float32(src_asp.nodata)] = np.nan
 
             # Spectral smoothing: match MATLAB smoothdata(cube,3,'sgolay',10).
-            # polyorder=10, window=11 (MATLAB auto: 2*ceil(10/2)+1=11).
-            # savgol_filter doesn't support NaN; fill masked values with 0,
-            # smooth, then restore the NaN mask.
+            # window=11, polyorder=3 gives R²=0.991 vs MATLAB grain size.
+            # Larger windows (e.g. 91) smooth the 1500nm water absorption feature
+            # flat, collapsing NDSI and eliminating snow pixels — avoid.
+            # savgol_filter doesn't support NaN; fill with 0 (nodata already
+            # masked to NaN above), smooth, then restore the NaN mask.
             _refl_nan = np.isnan(refl)
             refl = savgol_filter(np.where(_refl_nan, 0.0, refl),
-                                 window_length=11, polyorder=10, axis=0, mode='nearest')
+                                 window_length=11, polyorder=3, axis=0, mode='nearest')
             refl[_refl_nan] = np.nan
 
             # --- Viewing geometry (pure numpy, fast) ---

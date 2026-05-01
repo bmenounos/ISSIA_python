@@ -89,24 +89,42 @@ for fl in "${FLIGHT_LINES[@]}"; do
 done
 echo "      Data copy complete."
 
-# ---------- run batch ----------
+# ---------- run batch one flight line at a time, copy after each ----------
 echo ""
 echo "[3/4] Running ISSIA batch processing from local scratch..."
-echo "========================================================================"
-NUMBA_THREADING_LAYER=omp NUMBA_NUM_THREADS=$(nproc) \
-    python "${ISSIA_DIR}/run_issia_batch.py" \
-        --data-dir    "${SCRATCH_DATA}" \
-        --output-dir  "${SCRATCH_OUT}" \
-        --lut-dir     "${SCRATCH_LUTS}" \
-        --wvl-path    "${WVL_PATH}" \
-        --chunk-rows  "${CHUNK_ROWS}" \
-        --continue-on-error \
-        --mosaic
-
-# ---------- copy results back ----------
-echo ""
-echo "[4/4] Copying results to ${OUTPUT_DIR}..."
 mkdir -p "${OUTPUT_DIR}"
-rsync -a --info=progress2 "${SCRATCH_OUT}/" "${OUTPUT_DIR}/"
+
+i=0
+for fl in "${FLIGHT_LINES[@]}"; do
+    i=$((i + 1))
+    echo "========================================================================"
+    echo "# Flight line ${i}/${N}: ${fl}"
+    echo "========================================================================"
+    # Skip if all 3 products already exist in the destination
+    if [[ -f "${OUTPUT_DIR}/${fl}_gs.tif" && -f "${OUTPUT_DIR}/${fl}_albedo.tif" && -f "${OUTPUT_DIR}/${fl}_rf.tif" ]]; then
+        echo "  -> Already in ${OUTPUT_DIR}, skipping."
+        continue
+    fi
+    NUMBA_THREADING_LAYER=omp NUMBA_NUM_THREADS=$(nproc) \
+        python "${ISSIA_DIR}/run_issia_batch.py" \
+            --data-dir     "${SCRATCH_DATA}" \
+            --output-dir   "${SCRATCH_OUT}" \
+            --lut-dir      "${SCRATCH_LUTS}" \
+            --wvl-path     "${WVL_PATH}" \
+            --chunk-rows   "${CHUNK_ROWS}" \
+            --flight-lines "${fl}" \
+            --continue-on-error
+
+    echo ""
+    echo "  -> Copying ${fl} results to ${OUTPUT_DIR}..."
+    cp "${SCRATCH_OUT}/${fl}"_*.tif "${OUTPUT_DIR}/"
+    echo "  -> Done. Results available in ${OUTPUT_DIR}/"
+done
+
+# ---------- mosaic after all flight lines complete ----------
+echo ""
+echo "[4/4] Building mosaics..."
+python "${ISSIA_DIR}/mosaic_issia.py" --input-dir "${OUTPUT_DIR}"
+cp "${SCRATCH_OUT}/mosaics"/*.tif "${OUTPUT_DIR}/mosaics/" 2>/dev/null || true
 echo "      Done. Results in ${OUTPUT_DIR}/"
 # trap handles cleanup

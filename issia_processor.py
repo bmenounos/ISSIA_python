@@ -292,19 +292,21 @@ class ISSIAProcessorOptimized(ISSIAProcessor):
         # Handle .npz format for anisotropy
         if str(aniso_path).endswith('.npz'):
             with np.load(aniso_path) as data:
-                # Load into contiguous C-order array for Numba
-                self.anisotropy_lut = np.ascontiguousarray(data['data'])
+                arr = data['data']
+                # Convert dtype first (may be a no-op if already float32), then
+                # ensure contiguous — avoids holding two 6.8 GB copies simultaneously
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32)
+                self.anisotropy_lut = np.ascontiguousarray(arr)
         else:
+            # .npy path: convert in-place before making contiguous to cap peak RAM
+            if self.anisotropy_lut.dtype != np.float32:
+                self.anisotropy_lut = self.anisotropy_lut.astype(np.float32)
             self.anisotropy_lut = np.ascontiguousarray(self.anisotropy_lut)
-        
-        # Ensure all LUTs are contiguous
-        self.sbd_lut = np.ascontiguousarray(self.sbd_lut)
-        self.albedo_lut = np.ascontiguousarray(self.albedo_lut)
-        
-        # Store as float32 for Numba compatibility
-        self.sbd_lut = self.sbd_lut.astype(np.float32)
-        self.albedo_lut = self.albedo_lut.astype(np.float32)
-        self.anisotropy_lut = self.anisotropy_lut.astype(np.float32)
+
+        # Ensure all LUTs are contiguous float32
+        self.sbd_lut = np.ascontiguousarray(self.sbd_lut).astype(np.float32)
+        self.albedo_lut = np.ascontiguousarray(self.albedo_lut).astype(np.float32)
         
         # Pre-convert angle arrays to float32
         self._illum_angles_f32 = self.illumination_angles.astype(np.float32)
