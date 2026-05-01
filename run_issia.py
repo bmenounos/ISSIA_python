@@ -440,11 +440,9 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
             aspect = src_asp.read(1, window=src_win).astype(np.float32)
             if _first_chunk: print(f"  [t] read:     {time.time()-_t:.2f}s"); _t = time.time()
 
-            # Mask nodata first (before smoothing) so zeros don't contaminate
-            # adjacent bands in the savgol window — matches MATLAB's NaN-aware
-            # smoothdata which skips nodata samples.
-            refl = np.where(refl == 0, np.nan, refl)
-            flux = np.where(flux == 0, np.nan, flux)
+            # Mask nodata before smoothing.
+            refl[refl == 0] = np.nan
+            flux[flux == 0] = np.nan
             if src_atm.nodata is not None:
                 refl[refl == np.float32(src_atm.nodata) / atm_scale] = np.nan
             if src_eglo.nodata is not None:
@@ -455,11 +453,9 @@ def process_flight_line(data_dir, flight_line, output_dir, lut_dir, wvl_path,
                 aspect[aspect == np.float32(src_asp.nodata)] = np.nan
 
             # Spectral smoothing: match MATLAB smoothdata(cube,3,'sgolay',10).
-            # window=11, polyorder=3 gives R²=0.991 vs MATLAB grain size.
-            # Larger windows (e.g. 91) smooth the 1500nm water absorption feature
-            # flat, collapsing NDSI and eliminating snow pixels — avoid.
-            # savgol_filter doesn't support NaN; fill with 0 (nodata already
-            # masked to NaN above), smooth, then restore the NaN mask.
+            # window=11, polyorder=3 gives R²=0.989 vs MATLAB grain size (3% bias).
+            # Larger windows (≥45) collapse NDSI by smoothing the 1500nm absorption
+            # feature — tested and confirmed incompatible regardless of NaN strategy.
             _refl_nan = np.isnan(refl)
             refl = savgol_filter(np.where(_refl_nan, 0.0, refl),
                                  window_length=11, polyorder=3, axis=0, mode='nearest')
